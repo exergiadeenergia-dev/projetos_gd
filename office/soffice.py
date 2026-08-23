@@ -174,4 +174,19 @@ int close(int fd) {
             real_close(wake_w[fd]);
             wake_w[fd] = -1;
         }
-        if (wake_r[fd] >= 0) { real_close(wake_r[fd]); wake_r[fd]  =
+        if (wake_r[fd] >= 0) { real_close(wake_r[fd]); wake_r[fd]  = -1; }
+        if (peer_of[fd] >= 0) { real_close(peer_of[fd]); peer_of[fd] = -1; }
+
+        if (was_listener)
+            _exit(0);                        /* conversion done – exit */
+    }
+    return real_close(fd);
+}
+"""
+
+
+
+if __name__ == "__main__":
+    import sys
+    result = run_soffice(sys.argv[1:])
+    sys.exit(result.returncode)
