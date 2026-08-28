@@ -11,6 +11,7 @@ Publicar (acesso pelo navegador de qualquer lugar):
     Veja instruções no LEIA-ME.md
 """
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ sys.path.insert(0, str(BASE))
 from preencher_gd import preencher as preencher_energisa
 from recalc import recalc as recalc_xlsx
 from office.soffice import run_soffice
+from xml_cell_writer import restringir_impressao_para_pdf
 from preencher_equatorial import preencher as preencher_anexo1
 from preencher_docx_equatorial import (
     replace_everywhere,
@@ -249,27 +251,50 @@ def gerar_energisa(dados):
         ):
             st.warning(f"Atenção: erros encontrados na planilha: {resultado}")
 
-        with st.spinner("Gerando PDF..."):
-            import openpyxl
-            wb = openpyxl.load_workbook(str(xlsm_path), keep_vba=True, data_only=False)
-            manter = {"SOLICITACAO", "RELACAO DE CARGA", "FORMULARIO", "MD-SOLAR", "DU-SOLAR"}
-            for nome in wb.sheetnames:
-                if nome not in manter:
-                    wb[nome].print_area = "ZZ9000:ZZ9000"
-            print_path = tmp / f"{nome_base}_print.xlsm"
-            wb.save(str(print_path))
+        # Nomes das 5 abas que compõem o documento final, na ordem em que
+        # aparecem, e o nome de arquivo amigável de cada uma quando baixada
+        # separadamente.
+        ABAS_FINAIS = ["SOLICITACAO", "RELACAO DE CARGA", "FORMULARIO", "MD-SOLAR", "DU-SOLAR"]
+        NOME_ARQUIVO_ABA = {
+            "SOLICITACAO": "Solicitacao",
+            "RELACAO DE CARGA": "Levantamento_de_Carga",
+            "FORMULARIO": "Formulario",
+            "MD-SOLAR": "Memorial_Descritivo",
+            "DU-SOLAR": "Diagrama_Unifilar",
+        }
 
-            run_soffice(["--headless", "--convert-to", "pdf", "--outdir", str(tmp), str(print_path)])
-            from pypdf import PdfReader, PdfWriter
-            gerado_pdf = print_path.with_suffix(".pdf")
-            reader = PdfReader(str(gerado_pdf))
+        from pypdf import PdfReader, PdfWriter
+
+        def _converter_para_pdf_sem_paginas_em_branco(origem_xlsm: Path, abas: list) -> Path:
+            """Copia o .xlsm preenchido, restringe a impressão às `abas`
+            informadas SEM passar pelo openpyxl (que apaga as formas do
+            diagrama unifilar), converte para PDF e remove páginas em branco."""
+            sufixo = "-".join(a.replace(" ", "") for a in abas)
+            copia = tmp / f"{origem_xlsm.stem}_{sufixo}_tmp.xlsm"
+            shutil.copyfile(str(origem_xlsm), str(copia))
+            restringir_impressao_para_pdf(str(copia), abas)
+            run_soffice(["--headless", "--convert-to", "pdf", "--outdir", str(tmp), str(copia)])
+            reader = PdfReader(str(copia.with_suffix(".pdf")))
             writer = PdfWriter()
             for page in reader.pages:
                 if page.extract_text().strip():
                     writer.add_page(page)
+            return writer
+
+        with st.spinner("Gerando PDF..."):
+            writer = _converter_para_pdf_sem_paginas_em_branco(xlsm_path, ABAS_FINAIS)
             pdf_final = tmp / f"{nome_base}.pdf"
             with open(pdf_final, "wb") as f:
                 writer.write(f)
+
+        with st.spinner("Gerando documentos separados..."):
+            pdfs_separados = {}
+            for aba in ABAS_FINAIS:
+                writer_aba = _converter_para_pdf_sem_paginas_em_branco(xlsm_path, [aba])
+                caminho_aba = tmp / f"{nome_base}_{NOME_ARQUIVO_ABA[aba]}.pdf"
+                with open(caminho_aba, "wb") as f:
+                    writer_aba.write(f)
+                pdfs_separados[aba] = caminho_aba
 
         with st.spinner("Gerando arquivo para ANEEL..."):
             import openpyxl
@@ -289,8 +314,15 @@ def gerar_energisa(dados):
         st.success("Documentos gerados!")
         c1, c2, c3 = st.columns(3)
         c1.download_button("⬇️ Planilha (.xlsm)", xlsm_path.read_bytes(), xlsm_path.name)
-        c2.download_button("⬇️ PDF final", pdf_final.read_bytes(), pdf_final.name)
+        c2.download_button("⬇️ PDF final (todas as páginas)", pdf_final.read_bytes(), pdf_final.name)
         c3.download_button("⬇️ Arquivo ANEEL", aneel_path.read_bytes(), aneel_path.name)
+
+        st.subheader("Documentos separados")
+        cols_sep = st.columns(len(pdfs_separados))
+        for col, aba in zip(cols_sep, ABAS_FINAIS):
+            caminho = pdfs_separados[aba]
+            rotulo = NOME_ARQUIVO_ABA[aba].replace("_", " ")
+            col.download_button(f"⬇️ {rotulo}", caminho.read_bytes(), caminho.name, key=f"dl_{aba}")
 
 
 # ============================================================
