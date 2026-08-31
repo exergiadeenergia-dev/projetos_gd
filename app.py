@@ -10,15 +10,13 @@ Rodar localmente:
 Publicar (acesso pelo navegador de qualquer lugar):
     Veja instruções no LEIA-ME.md
 """
-import io
 import json
-import shutil
+import re
 import subprocess
 import sys
 import tempfile
-import zipfile
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import streamlit as st
 import pandas as pd
@@ -30,7 +28,6 @@ sys.path.insert(0, str(BASE))
 from preencher_gd import preencher as preencher_energisa
 from recalc import recalc as recalc_xlsx
 from office.soffice import run_soffice
-from xml_cell_writer import restringir_impressao_para_pdf
 from preencher_equatorial import preencher as preencher_anexo1
 from preencher_docx_equatorial import (
     replace_everywhere,
@@ -76,9 +73,9 @@ MES_PT = ["JANEIRO", "FEVEREIRO", "MARÇO", "ABRIL", "MAIO", "JUNHO", "JULHO",
           "AGOSTO", "SETEMBRO", "OUTUBRO", "NOVEMBRO", "DEZEMBRO"]
 
 
-def slug_arquivo(nome: str, uc: str) -> str:
-    base = nome.strip().upper().replace(" ", "_")
-    uc_limpo = uc.strip().replace(" ", "_")
+def slug_arquivo(nome: str, uc) -> str:
+    base = str(nome).strip().upper().replace(" ", "_")
+    uc_limpo = str(uc).strip().replace(" ", "_")
     return f"{base}_UC_{uc_limpo}"
 
 
@@ -100,180 +97,134 @@ def tabela_equipamentos(label, colunas, valores_padrao, key):
     return edited.to_dict("records")
 
 
-# ============================================================
-# Downloads persistentes: o Streamlit reroda o script inteiro a cada
-# clique (inclusive em botão de download), e antes disso os arquivos
-# ficavam só numa pasta temporária que já tinha sido apagada -- por isso
-# os outros downloads "sumiam". Agora o conteúdo de cada arquivo fica
-# guardado em st.session_state (na memória da sessão do navegador) e os
-# botões são desenhados a partir dali, então sobrevivem a qualquer clique.
-# ============================================================
-def _zip_bytes(itens):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for _, nome_arquivo, conteudo in itens:
-            zf.writestr(nome_arquivo, conteudo)
-    return buf.getvalue()
+MESES_EN_PT = {
+    1: "JANEIRO", 2: "FEVEREIRO", 3: "MARÇO", 4: "ABRIL", 5: "MAIO", 6: "JUNHO",
+    7: "JULHO", 8: "AGOSTO", 9: "SETEMBRO", 10: "OUTUBRO", 11: "NOVEMBRO", 12: "DEZEMBRO",
+}
 
 
-def salvar_resultado(chave_sessao, principais, separados=None, nome_zip="documentos.zip",
-                      avisos=None, aviso_final=None):
-    """principais / separados: lista de tuplas (rotulo, nome_arquivo, bytes)."""
-    st.session_state[chave_sessao] = {
-        "principais": principais,
-        "separados": separados or [],
-        "nome_zip": nome_zip,
-        "avisos": avisos,
-        "aviso_final": aviso_final,
-    }
-
-
-def mostrar_downloads(chave_sessao):
-    r = st.session_state.get(chave_sessao)
-    if not r:
-        return
-
-    if r["avisos"]:
-        st.warning("⚠️ Checagem de viabilidade do Anexo I:\n" + "\n".join(f"- {a}" for a in r["avisos"]))
-    elif r["avisos"] is not None:
-        st.success("Checagem de viabilidade: OK")
-
-    st.success("Documentos gerados!")
-
-    todos = r["principais"] + r["separados"]
-    st.download_button("⬇️ Baixar tudo (.zip)", _zip_bytes(todos), r["nome_zip"],
-                        type="primary", key=f"{chave_sessao}_zip_tudo")
-
-    cols = st.columns(len(r["principais"]))
-    for col, (rotulo, nome_arquivo, conteudo) in zip(cols, r["principais"]):
-        col.download_button(f"⬇️ {rotulo}", conteudo, nome_arquivo, key=f"{chave_sessao}_{nome_arquivo}")
-
-    if r["separados"]:
-        st.subheader("Documentos separados")
-        cols2 = st.columns(len(r["separados"]))
-        for col, (rotulo, nome_arquivo, conteudo) in zip(cols2, r["separados"]):
-            col.download_button(f"⬇️ {rotulo}", conteudo, nome_arquivo, key=f"{chave_sessao}_{nome_arquivo}")
-
-    if r["aviso_final"]:
-        st.info(r["aviso_final"])
-
-
-# ============================================================
-# ARQUIVO DE DADOS PRONTO (.txt) — upgrade pedido pelo usuário: em vez de
-# preencher o formulário na mão, é possível enviar um arquivo de texto
-# simples no formato "chave: valor" (um por linha) já com todos os dados,
-# e o app gera os documentos direto a partir dele.
-#
-# Para listas (cargas, painéis, inversores, módulos), repete-se um bloco
-# "[nome_da_lista]" por item, um bloco por linha em branco. Uma linha em
-# branco também "fecha" o bloco atual e volta a ler campos comuns.
-# ============================================================
-def _float(valor, padrao=0.0):
-    if valor is None or str(valor).strip() == "":
-        return padrao
+def _converter_valor(v: str):
+    """Tenta converter para int, depois float; senão devolve a string original."""
+    v = v.strip()
     try:
-        return float(str(valor).strip().replace(",", "."))
+        return int(v)
     except ValueError:
-        return padrao
-
-
-def _int(valor, padrao=0):
-    if valor is None or str(valor).strip() == "":
-        return padrao
+        pass
     try:
-        return int(float(str(valor).strip().replace(",", ".")))
+        return float(v.replace(",", "."))
     except ValueError:
-        return padrao
+        pass
+    return v
 
 
-def _data_txt(valor, padrao=None):
-    """Aceita DD/MM/AAAA ou AAAA-MM-DD; se não conseguir ler, usa `padrao`."""
-    if not valor or not str(valor).strip():
-        return padrao
-    from datetime import datetime as _dt
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
-        try:
-            return _dt.strptime(str(valor).strip(), fmt).date()
-        except ValueError:
-            continue
-    return padrao
-
-
-def parse_arquivo_dados(texto: str) -> dict:
-    """Lê o formato 'chave: valor' com blocos [secao] para tabelas.
-    Retorna {"campos": {...}, "tabelas": {"secao": [ {...}, {...} ]}}."""
+def parse_texto_colado(texto: str) -> dict:
+    """Faz o parse do formato 'chave: valor' com blocos repetíveis [nome]
+    (ex: [cargas], [paineis], [inversores]) para um dict pronto pra gerar
+    os documentos, sem precisar preencher tabela por tabela na tela."""
     campos = {}
-    tabelas = {}
-    secao_atual = None
+    blocos = {}  # nome_do_bloco -> lista de dicts
+    bloco_atual = None
     item_atual = None
 
     for linha_bruta in texto.splitlines():
         linha = linha_bruta.strip()
-        if not linha or linha.startswith("#"):
-            secao_atual = None
-            item_atual = None
+        if not linha:
             continue
-        if linha.startswith("[") and linha.endswith("]"):
-            nome_secao = linha[1:-1].strip().lower()
-            secao_atual = nome_secao
+        if linha.startswith("----") or linha.startswith("#"):
+            # uma linha separadora de seção sempre fecha qualquer bloco
+            # [cargas]/[paineis]/[inversores] que ainda esteja aberto —
+            # sem isso, os campos da seção seguinte (ex: disjuntor_geral_a)
+            # acabavam grudados dentro do último item do bloco anterior.
+            if bloco_atual and item_atual is not None:
+                blocos.setdefault(bloco_atual, []).append(item_atual)
+                bloco_atual = None
+                item_atual = None
+            continue
+        m = re.match(r"^\[(\w+)\]$", linha)
+        if m:
+            if bloco_atual and item_atual is not None:
+                blocos.setdefault(bloco_atual, []).append(item_atual)
+            bloco_atual = m.group(1).lower()
             item_atual = {}
-            tabelas.setdefault(nome_secao, []).append(item_atual)
             continue
-        if ":" not in linha:
-            continue
-        chave, valor = linha.split(":", 1)
-        chave = chave.strip().lower().replace(" ", "_")
-        valor = valor.strip()
-        if secao_atual is not None and item_atual is not None:
-            item_atual[chave] = valor
-        else:
-            campos[chave] = valor
+        if ":" in linha:
+            chave, valor = linha.split(":", 1)
+            chave = chave.strip().lower()
+            valor = _converter_valor(valor)
+            if item_atual is not None:
+                item_atual[chave] = valor
+            else:
+                campos[chave] = valor
 
-    return {"campos": campos, "tabelas": tabelas}
+    if bloco_atual and item_atual is not None:
+        blocos.setdefault(bloco_atual, []).append(item_atual)
+
+    campos["_blocos"] = blocos
+
+    # normaliza data de previsão de ligação (aceita "Sep 15, 2026",
+    # "15/09/2026", "2026-09-15" etc.) para mês/ano em português
+    data_str = campos.pop("data_previsao_ligacao", None)
+    if data_str:
+        data_convertida = None
+        for fmt in ("%b %d, %Y", "%B %d, %Y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                data_convertida = datetime.strptime(str(data_str).strip(), fmt)
+                break
+            except ValueError:
+                continue
+        if data_convertida:
+            campos["mes_previsao_ligacao"] = MESES_EN_PT[data_convertida.month]
+            campos["ano_previsao_ligacao"] = data_convertida.year
+
+    return campos
 
 
-TEMPLATE_ENERGISA_TXT = """\
+def campo_colar_dados(exemplo: str, ajuda_blocos: str) -> dict | None:
+    """Mostra a caixa de texto pra colar os dados e devolve o dict parseado,
+    ou None se o usuário não colou nada."""
+    with st.expander("📋 Colar dados em texto (mais rápido que preencher campo por campo)"):
+        st.caption(
+            "Cole os dados no formato `chave: valor`, um por linha. "
+            f"Use blocos repetíveis pra listas: {ajuda_blocos}"
+        )
+        st.code(exemplo, language="text")
+        texto = st.text_area("Cole aqui", height=200, key="colar_" + ajuda_blocos[:10])
+    if texto and texto.strip():
+        return parse_texto_colado(texto)
+    return None
+
+
 # ============================================================
-# MODELO — Energisa-MT — Gerador de Documentos GD
-# Preencha "chave: valor", uma linha por campo. Linhas com # são só
-# explicação e podem ser apagadas. Para repetir cargas/painéis/inversores,
-# copie o bloco [xxx] quantas vezes precisar (um bloco por item).
+# ENERGISA-MT
 # ============================================================
+def form_energisa():
+    st.header("Energisa-MT")
 
-uc:
+    exemplo = """uc: 74561701723
 classe: RESIDENCIAL
-titular:
-logradouro:
-numero:
-bairro:
-cidade:
+titular: Nome Completo do Cliente
+logradouro: Rua Exemplo
+numero: 100
+bairro: Centro
+cidade: Barra do Garças
 uf: MT
-cep:
-email: não informado
-celular:
-cpf_cnpj:
-
-potencia_instalada_kw:
+cep: 78600-000
+email: cliente@email.com
+celular: 66 99999-9999
+cpf_cnpj: 000.000.000-00
+potencia_instalada_kw: 15
 tensao_atendimento_v: 220
 tipo_conexao: MONOFÁSICO
 tipo_ramal: AÉREO
 
-# ---- Relação de carga: repita o bloco [cargas] para cada equipamento ----
-
+---- Relação de carga: repita o bloco [cargas] para cada equipamento ----
 [cargas]
 quantidade: 2
 equipamento: CHUVEIRO
 pot_unitaria_w: 4500
 fator_demanda: 0.82
 
-[cargas]
-quantidade: 1
-equipamento: Ar Condicionado
-pot_unitaria_w: 1300
-fator_demanda: 0.82
-
-# ---- Proteções e padrão ----
-
+---- Proteções e padrão ----
 disjuntor_geral_a: 50
 fator_potencia: 0.92
 demanda_contratada_kw: 0
@@ -282,306 +233,111 @@ disjuntor_ca_a: 50
 dps_cc_ka: 20
 disjuntor_cc_a: 32
 modalidade: Autoconsumo remoto
-potencia_trafo:
+potencia_trafo: 45
 numero_hastes: 6
 
-# ---- Coordenadas e previsão de ligação ----
-
-fuso:
-coord_x:
-coord_y:
-data_previsao_ligacao: 15/09/2026
+---- Coordenadas e previsão de ligação ----
+fuso: 22L
+coord_x: 358297
+coord_y: 8245026
+data_previsao_ligacao: Sep 15, 2026
 zona: URBANO
 gd_ja_instalado: NÃO
 
-# ---- Painéis: repita o bloco [paineis] para cada modelo ----
-
+---- Painéis: repita o bloco [paineis] para cada modelo ----
 [paineis]
-quantidade: 10
-fabricante:
-modelo:
-area_m2:
-potencia_kw:
+quantidade: 9
+fabricante: Maxeon
+modelo: SPR-P6-550-UPP
+area_m2: 18
+potencia_kw: 0.55
 
-# ---- Inversores: repita o bloco [inversores] para cada modelo ----
-
+---- Inversores: repita o bloco [inversores] para cada modelo ----
 [inversores]
 quantidade: 1
-fabricante:
-modelo:
-potencia_kw:
-tensao_nominal_v: 220
+fabricante: Auxsol
+modelo: ASN-5SL-G2
+potencia_kw: 5
+tensao_nominal_v: 220"""
 
-# ---- Responsável técnico (opcional — se deixar em branco, usa o padrão) ----
+    colado = campo_colar_dados(exemplo, "[cargas], [paineis], [inversores]")
 
-resp_nome:
-resp_telefone:
-resp_email:
-"""
+    if colado:
+        st.success("Texto reconhecido! Confira o resumo abaixo antes de gerar.")
+        blocos = colado.pop("_blocos", {})
+        cargas = blocos.get("cargas", [])
+        paineis = blocos.get("paineis", [])
+        inversores = blocos.get("inversores", [])
 
-TEMPLATE_EQUATORIAL_TXT = """\
-# ============================================================
-# MODELO — Equatorial-GO — Gerador de Documentos GD
-# Preencha "chave: valor", uma linha por campo. Linhas com # são só
-# explicação e podem ser apagadas. Para repetir módulos/inversores, copie
-# o bloco [xxx] quantas vezes precisar (um bloco por item).
-# ============================================================
+        faltando = [c for c in ("uc", "titular") if not colado.get(c)]
+        st.write(
+            f"**{colado.get('titular','?')}** — UC {colado.get('uc','?')} — "
+            f"{len(cargas)} carga(s), {len(paineis)} modelo(s) de painel, "
+            f"{len(inversores)} modelo(s) de inversor"
+        )
+        with st.expander("Ver dados completos reconhecidos"):
+            st.json({**colado, "cargas": cargas, "paineis": paineis, "inversores": inversores})
 
-nome:
-cpf_cnpj:
-celular:
-endereco:
-email:
-cep: 76240000
-municipio: Aragarças
-uf: GO
-bairro:
-uc_existente:
+        if faltando:
+            st.error(f"Faltam campos obrigatórios no texto colado: {', '.join(faltando)}")
+            return
+        if not cargas:
+            st.warning("Nenhuma carga (bloco [cargas]) reconhecida no texto.")
+        if not paineis:
+            st.warning("Nenhum painel (bloco [paineis]) reconhecido no texto.")
+        if not inversores:
+            st.warning("Nenhum inversor (bloco [inversores]) reconhecido no texto.")
 
-tipo_ligacao: MONOFÁSICO
-tensao_atendimento_v: 220
-classe: Residencial
-disjuntor_entrada_a: 50
-carga_declarada_kw: 10
-potencia_disponibilizada_kw: 10
-tipo_ramal: AÉREO
+        if st.button("Gerar documentos a partir do texto colado (Energisa-MT)", type="primary"):
+            dados = {
+                "responsavel_tecnico": {
+                    "nome": "Alex Gomes da Silva",
+                    "telefone": "(66) 9 9964-5914",
+                    "email": "alexgomes.eng.energ@gmail.com",
+                },
+                "cliente": {
+                    "uc": colado.get("uc", ""), "classe": colado.get("classe", "RESIDENCIAL"),
+                    "titular": colado.get("titular", ""), "logradouro": colado.get("logradouro", ""),
+                    "numero": colado.get("numero", ""), "bairro": colado.get("bairro", ""),
+                    "cidade": colado.get("cidade", ""), "uf": colado.get("uf", "MT"),
+                    "cep": colado.get("cep", ""), "email": colado.get("email", "não informado"),
+                    "telefone": "", "celular": colado.get("celular", ""),
+                    "cpf_cnpj": colado.get("cpf_cnpj", ""),
+                    "potencia_instalada_kw": colado.get("potencia_instalada_kw", 0),
+                    "tensao_atendimento_v": str(colado.get("tensao_atendimento_v", "220")),
+                    "tipo_conexao": colado.get("tipo_conexao", "MONOFÁSICO"),
+                    "tipo_ramal": colado.get("tipo_ramal", "AÉREO"),
+                    "tipo_fonte_geracao": "SOLAR FOTOVOLTAICA",
+                    "tipo_geracao": "Empregando conversor eletrônico/inversor",
+                    "cargas": cargas,
+                    "disjuntor_geral_a": colado.get("disjuntor_geral_a", 50),
+                    "fator_potencia": colado.get("fator_potencia", 0.92),
+                    "demanda_contratada_kw": colado.get("demanda_contratada_kw", 0),
+                    "dps_ca_ka": colado.get("dps_ca_ka", 20),
+                    "disjuntor_ca_a": colado.get("disjuntor_ca_a", 50),
+                    "dps_cc_ka": colado.get("dps_cc_ka", 20),
+                    "disjuntor_cc_a": colado.get("disjuntor_cc_a", 32),
+                    "modalidade": colado.get("modalidade", "Autoconsumo remoto"),
+                    "potencia_trafo": colado.get("potencia_trafo", ""),
+                    "numero_hastes": colado.get("numero_hastes", 6),
+                    "demanda_contratada_kwg": 0,
+                    "fuso": colado.get("fuso", ""), "coord_x": colado.get("coord_x", ""),
+                    "coord_y": colado.get("coord_y", ""),
+                    "tipo_tensao": "BAIXA", "cabos_por_fase": 1,
+                    "bitola_fase": 10, "bitola_neutro": 10, "bitola_terra": 10,
+                    "gd_ja_instalado": colado.get("gd_ja_instalado", "SIM"),
+                    "mes_previsao_ligacao": colado.get("mes_previsao_ligacao", MES_PT[date.today().month - 1]),
+                    "ano_previsao_ligacao": colado.get("ano_previsao_ligacao", date.today().year),
+                    "zona": colado.get("zona", "URBANO"),
+                    "paineis": paineis, "inversores": inversores,
+                    "necessita_autotrafo": "NÃO", "trafo_exclusivo": "NÃO",
+                },
+            }
+            gerar_energisa(dados)
+        return
 
-fuso:
-coord_x:
-coord_y:
-modalidade_compensacao: AUTOCONSUMO LOCAL
-data_inicio_operacao: 15/09/2026
-
-# ---- Módulos: repita o bloco [modulos] para cada modelo ----
-
-[modulos]
-potencia_w: 590
-quantidade: 8
-fabricante: OSDA
-modelo: ODA590-36V-MHD
-
-# ---- Inversores: repita o bloco [inversores] para cada modelo ----
-
-[inversores]
-fabricante: SOFAR
-modelo: 5KTLM-G3
-potencia_nominal_kw: 5
-faixa_tensao_v: 220
-corrente_nominal_a:
-fator_potencia: 1
-rendimento_pct: 98
-dht_corrente_pct: 3
-
-# ---- Responsável técnico (opcional — se deixar em branco, usa o padrão) ----
-
-resp_nome:
-resp_telefone:
-resp_email:
-
-# ---- Observação ----
-# A foto de localização (opcional) continua sendo enviada separadamente,
-# pelo campo de upload de imagem do formulário (seção 6).
-"""
-
-
-def montar_dados_energisa_de_txt(texto: str, resp_padrao: dict) -> dict:
-    parsed = parse_arquivo_dados(texto)
-    c = parsed["campos"]
-    t = parsed["tabelas"]
-
-    cargas = [
-        {
-            "quantidade": _int(item.get("quantidade")),
-            "equipamento": item.get("equipamento", ""),
-            "pot_unitaria_w": _float(item.get("pot_unitaria_w")),
-            "fator_demanda": _float(item.get("fator_demanda")),
-        }
-        for item in t.get("cargas", [])
-    ]
-    paineis = [
-        {
-            "quantidade": _int(item.get("quantidade")),
-            "fabricante": item.get("fabricante", ""),
-            "modelo": item.get("modelo", ""),
-            "area_m2": _float(item.get("area_m2")),
-            "potencia_kw": _float(item.get("potencia_kw")),
-        }
-        for item in t.get("paineis", [])
-    ]
-    inversores = [
-        {
-            "quantidade": _int(item.get("quantidade")),
-            "fabricante": item.get("fabricante", ""),
-            "modelo": item.get("modelo", ""),
-            "potencia_kw": _float(item.get("potencia_kw")),
-            "tensao_nominal_v": item.get("tensao_nominal_v", "220"),
-        }
-        for item in t.get("inversores", [])
-    ]
-
-    data_prevista = _data_txt(c.get("data_previsao_ligacao")) or (date.today() + timedelta(days=15))
-
-    resp = {
-        "nome": c.get("resp_nome") or resp_padrao["nome"],
-        "telefone": c.get("resp_telefone") or resp_padrao["telefone"],
-        "email": c.get("resp_email") or resp_padrao["email"],
-    }
-
-    return {
-        "responsavel_tecnico": resp,
-        "cliente": {
-            "uc": c.get("uc", ""), "classe": c.get("classe", "RESIDENCIAL"),
-            "titular": c.get("titular", ""), "logradouro": c.get("logradouro", ""),
-            "numero": c.get("numero", ""), "bairro": c.get("bairro", ""),
-            "cidade": c.get("cidade", ""), "uf": c.get("uf", "MT"), "cep": c.get("cep", ""),
-            "email": c.get("email") or "não informado", "telefone": "",
-            "celular": c.get("celular", ""), "cpf_cnpj": c.get("cpf_cnpj", ""),
-            "potencia_instalada_kw": _float(c.get("potencia_instalada_kw")),
-            "tensao_atendimento_v": c.get("tensao_atendimento_v", "220"),
-            "tipo_conexao": c.get("tipo_conexao", "MONOFÁSICO"),
-            "tipo_ramal": c.get("tipo_ramal", "AÉREO"),
-            "tipo_fonte_geracao": "SOLAR FOTOVOLTAICA",
-            "tipo_geracao": "Empregando conversor eletrônico/inversor",
-            "cargas": cargas,
-            "disjuntor_geral_a": _int(c.get("disjuntor_geral_a"), 50),
-            "fator_potencia": _float(c.get("fator_potencia"), 0.92),
-            "demanda_contratada_kw": _float(c.get("demanda_contratada_kw")),
-            "dps_ca_ka": _int(c.get("dps_ca_ka"), 20),
-            "disjuntor_ca_a": _int(c.get("disjuntor_ca_a"), 50),
-            "dps_cc_ka": _int(c.get("dps_cc_ka"), 20),
-            "disjuntor_cc_a": _int(c.get("disjuntor_cc_a"), 32),
-            "modalidade": c.get("modalidade", "Autoconsumo remoto"),
-            "potencia_trafo": c.get("potencia_trafo", ""),
-            "numero_hastes": _int(c.get("numero_hastes"), 6),
-            "demanda_contratada_kwg": 0,
-            "fuso": c.get("fuso", ""), "coord_x": c.get("coord_x", ""), "coord_y": c.get("coord_y", ""),
-            "tipo_tensao": "BAIXA", "cabos_por_fase": 1,
-            "bitola_fase": 10, "bitola_neutro": 10, "bitola_terra": 10,
-            "gd_ja_instalado": c.get("gd_ja_instalado", "NÃO"),
-            "mes_previsao_ligacao": MES_PT[data_prevista.month - 1],
-            "ano_previsao_ligacao": data_prevista.year,
-            "zona": c.get("zona", "URBANO"),
-            "paineis": paineis, "inversores": inversores,
-            "necessita_autotrafo": "NÃO", "trafo_exclusivo": "NÃO",
-        },
-    }
-
-
-def montar_dados_equatorial_de_txt(texto: str, resp_padrao: dict) -> dict:
-    parsed = parse_arquivo_dados(texto)
-    c = parsed["campos"]
-    t = parsed["tabelas"]
-
-    modulos = [
-        {
-            "potencia_w": _float(item.get("potencia_w")),
-            "quantidade": _int(item.get("quantidade")),
-            "fabricante": item.get("fabricante", ""),
-            "modelo": item.get("modelo", ""),
-        }
-        for item in t.get("modulos", [])
-    ]
-    inversores = [
-        {
-            "fabricante": item.get("fabricante", ""),
-            "modelo": item.get("modelo", ""),
-            "potencia_nominal_kw": _float(item.get("potencia_nominal_kw")),
-            "faixa_tensao_v": item.get("faixa_tensao_v", "220"),
-            "corrente_nominal_a": _float(item.get("corrente_nominal_a")),
-            "fator_potencia": _float(item.get("fator_potencia"), 1.0),
-            "rendimento_pct": _float(item.get("rendimento_pct"), 98.0),
-            "dht_corrente_pct": _float(item.get("dht_corrente_pct"), 3.0),
-        }
-        for item in t.get("inversores", [])
-    ]
-
-    data_inicio = _data_txt(c.get("data_inicio_operacao")) or (date.today() + timedelta(days=15))
-    uf = c.get("uf", "GO")
-    endereco = c.get("endereco", "")
-    bairro = c.get("bairro", "")
-    uc_existente = c.get("uc_existente", "")
-    celular = c.get("celular", "")
-
-    resp_nome = c.get("resp_nome") or resp_padrao["nome"]
-    resp_telefone = c.get("resp_telefone") or resp_padrao["telefone"]
-    resp_email = c.get("resp_email") or resp_padrao["email"]
-
-    return {
-        "responsavel_tecnico": {
-            "nome": resp_nome, "titulo_profissional": "Engenheiro de Energia",
-            "registro_profissional": 436143, "uf_registro": "MT",
-            "email": resp_email,
-            "telefone": resp_telefone.replace(" ", "").replace("(", "").replace(")", "").replace("-", ""),
-        },
-        "premissas_fixas": {
-            "tarifa_branca": "NÃO", "vistoria_apos_solicitacao": "NÃO",
-            "autoriza_entrega_contratos": "SIM", "declara_conformidade_normas": "SIM",
-            "grid_zero": "NÃO", "gratuidade_ren": "NÃO",
-            "autoriza_faturas_email": "NÃO", "declara_veracidade": "SIM",
-        },
-        "_referencia_hakknner": REFERENCIA_HAKKNNER,
-        "cliente": {
-            "nome": c.get("nome", ""), "cpf_cnpj": c.get("cpf_cnpj", ""), "celular": celular,
-            "telefone_fixo": "",
-            "endereco": endereco, "email": c.get("email", ""), "cep": c.get("cep", "76240000"),
-            "municipio": c.get("municipio", "Aragarças"),
-            "uf": uf, "uf_extenso": "Goiás" if uf == "GO" else uf,
-            "receber_fatura_email": "NÃO",
-            "tipo_orcamento": "Orçamento de Conexão", "uc_existente": uc_existente,
-            "tipo_solicitacao": "CONEXÃO DE GD EM UNIDADE CONSUMIDORA EXISTENTE SEM AUMENTO DE POTÊNCIA DISPONIBILIZADA (ver item abaixo)",
-            "cargas_especiais": "NÃO", "ramo_atividade": c.get("classe", "Residencial"),
-            "classe": c.get("classe", "Residencial"),
-            "tipo_ligacao": c.get("tipo_ligacao", "MONOFÁSICO"),
-            "tensao_atendimento_v": _int(c.get("tensao_atendimento_v"), 220),
-            "carga_declarada_kw": _float(c.get("carga_declarada_kw"), 10.0),
-            "disjuntor_entrada_a": _int(c.get("disjuntor_entrada_a"), 50),
-            "potencia_disponibilizada_kw": _float(c.get("potencia_disponibilizada_kw"), 10.0),
-            "tipo_ramal": c.get("tipo_ramal", "AÉREO"),
-            "fuso": c.get("fuso", ""), "coord_x": c.get("coord_x", ""), "coord_y": c.get("coord_y", ""),
-            "modalidade_compensacao": c.get("modalidade_compensacao", "AUTOCONSUMO LOCAL"),
-            "data_inicio_operacao": data_inicio.isoformat(),
-            "conta_contrato": uc_existente, "bairro": bairro,
-            "mes_ano_documento": f"{MES_PT[data_inicio.month - 1].capitalize()} – {data_inicio.year}",
-            "telefone_cliente": celular,
-            "data_conclusao_geradora": data_inicio.strftime("%d/%m/%Y"),
-            "endereco_completo_comissionamento": f"{endereco.upper()}\n{bairro.upper()}",
-            "modulos": modulos, "inversores": inversores,
-        },
-    }
-
-
-# ============================================================
-# ENERGISA-MT
-# ============================================================
-def form_energisa():
-    st.header("Energisa-MT")
+    st.divider()
     resp = responsavel_tecnico_form()
-
-    with st.expander("📄 Já tem os dados prontos? Preencha a partir de um arquivo .txt"):
-        st.caption(
-            "Baixe o modelo, preencha os campos num editor de texto simples "
-            "(Bloco de Notas, etc.) e envie de volta aqui — os documentos são "
-            "gerados direto, sem precisar preencher o formulário abaixo."
-        )
-        st.download_button(
-            "⬇️ Baixar modelo (.txt)", TEMPLATE_ENERGISA_TXT, "modelo_energisa.txt",
-            key="modelo_energisa_txt",
-        )
-        arquivo_txt = st.file_uploader(
-            "Enviar arquivo preenchido (.txt)", type=["txt"], key="upload_energisa_txt",
-        )
-        if arquivo_txt is not None:
-            texto = arquivo_txt.getvalue().decode("utf-8", errors="replace")
-            dados_txt = montar_dados_energisa_de_txt(texto, resp)
-            st.caption("Prévia dos dados lidos do arquivo:")
-            st.json(dados_txt, expanded=False)
-            if st.button("Gerar documentos a partir do arquivo", type="primary", key="gerar_energisa_txt"):
-                if not dados_txt["cliente"]["uc"] or not dados_txt["cliente"]["titular"]:
-                    st.error("O arquivo precisa ter pelo menos os campos 'uc' e 'titular' preenchidos.")
-                else:
-                    gerar_energisa(dados_txt)
-
-    st.markdown("---")
 
     st.subheader("1. Dados da Unidade Consumidora")
     c1, c2, c3 = st.columns(3)
@@ -711,8 +467,6 @@ def form_energisa():
         }
         gerar_energisa(dados)
 
-    mostrar_downloads("energisa_resultado")
-
 
 def gerar_energisa(dados):
     nome_base = slug_arquivo(dados["cliente"]["titular"], dados["cliente"]["uc"])
@@ -731,50 +485,27 @@ def gerar_energisa(dados):
         ):
             st.warning(f"Atenção: erros encontrados na planilha: {resultado}")
 
-        # Nomes das 5 abas que compõem o documento final, na ordem em que
-        # aparecem, e o nome de arquivo amigável de cada uma quando baixada
-        # separadamente.
-        ABAS_FINAIS = ["SOLICITACAO", "RELACAO DE CARGA", "FORMULARIO", "MD-SOLAR", "DU-SOLAR"]
-        NOME_ARQUIVO_ABA = {
-            "SOLICITACAO": "Solicitacao",
-            "RELACAO DE CARGA": "Levantamento_de_Carga",
-            "FORMULARIO": "Formulario",
-            "MD-SOLAR": "Memorial_Descritivo",
-            "DU-SOLAR": "Diagrama_Unifilar",
-        }
+        with st.spinner("Gerando PDF..."):
+            import openpyxl
+            wb = openpyxl.load_workbook(str(xlsm_path), keep_vba=True, data_only=False)
+            manter = {"SOLICITACAO", "RELACAO DE CARGA", "FORMULARIO", "MD-SOLAR", "DU-SOLAR"}
+            for nome in wb.sheetnames:
+                if nome not in manter:
+                    wb[nome].print_area = "ZZ9000:ZZ9000"
+            print_path = tmp / f"{nome_base}_print.xlsm"
+            wb.save(str(print_path))
 
-        from pypdf import PdfReader, PdfWriter
-
-        def _converter_para_pdf_sem_paginas_em_branco(origem_xlsm: Path, abas: list) -> Path:
-            """Copia o .xlsm preenchido, restringe a impressão às `abas`
-            informadas SEM passar pelo openpyxl (que apaga as formas do
-            diagrama unifilar), converte para PDF e remove páginas em branco."""
-            sufixo = "-".join(a.replace(" ", "") for a in abas)
-            copia = tmp / f"{origem_xlsm.stem}_{sufixo}_tmp.xlsm"
-            shutil.copyfile(str(origem_xlsm), str(copia))
-            restringir_impressao_para_pdf(str(copia), abas)
-            run_soffice(["--headless", "--convert-to", "pdf", "--outdir", str(tmp), str(copia)])
-            reader = PdfReader(str(copia.with_suffix(".pdf")))
+            run_soffice(["--headless", "--convert-to", "pdf", "--outdir", str(tmp), str(print_path)])
+            from pypdf import PdfReader, PdfWriter
+            gerado_pdf = print_path.with_suffix(".pdf")
+            reader = PdfReader(str(gerado_pdf))
             writer = PdfWriter()
             for page in reader.pages:
                 if page.extract_text().strip():
                     writer.add_page(page)
-            return writer
-
-        with st.spinner("Gerando PDF..."):
-            writer = _converter_para_pdf_sem_paginas_em_branco(xlsm_path, ABAS_FINAIS)
             pdf_final = tmp / f"{nome_base}.pdf"
             with open(pdf_final, "wb") as f:
                 writer.write(f)
-
-        with st.spinner("Gerando documentos separados..."):
-            pdfs_separados = {}
-            for aba in ABAS_FINAIS:
-                writer_aba = _converter_para_pdf_sem_paginas_em_branco(xlsm_path, [aba])
-                caminho_aba = tmp / f"{nome_base}_{NOME_ARQUIVO_ABA[aba]}.pdf"
-                with open(caminho_aba, "wb") as f:
-                    writer_aba.write(f)
-                pdfs_separados[aba] = caminho_aba
 
         with st.spinner("Gerando arquivo para ANEEL..."):
             import openpyxl
@@ -791,23 +522,11 @@ def gerar_energisa(dados):
             aneel_path = tmp / f"{nome_base}_ANEEL.xlsx"
             wb_out.save(str(aneel_path))
 
-        # Lê tudo para a memória AQUI DENTRO, antes da pasta temporária ser
-        # apagada ao sair do "with" -- é isso que permite os downloads
-        # sobreviverem a cliques subsequentes (ver salvar_resultado/
-        # mostrar_downloads mais acima no arquivo).
-        salvar_resultado(
-            "energisa_resultado",
-            principais=[
-                ("Planilha (.xlsm)", xlsm_path.name, xlsm_path.read_bytes()),
-                ("PDF final (todas as páginas)", pdf_final.name, pdf_final.read_bytes()),
-                ("Arquivo ANEEL", aneel_path.name, aneel_path.read_bytes()),
-            ],
-            separados=[
-                (NOME_ARQUIVO_ABA[aba].replace("_", " "), pdfs_separados[aba].name, pdfs_separados[aba].read_bytes())
-                for aba in ABAS_FINAIS
-            ],
-            nome_zip=f"{nome_base}_documentos.zip",
-        )
+        st.success("Documentos gerados!")
+        c1, c2, c3 = st.columns(3)
+        c1.download_button("⬇️ Planilha (.xlsm)", xlsm_path.read_bytes(), xlsm_path.name)
+        c2.download_button("⬇️ PDF final", pdf_final.read_bytes(), pdf_final.name)
+        c3.download_button("⬇️ Arquivo ANEEL", aneel_path.read_bytes(), aneel_path.name)
 
 
 # ============================================================
@@ -815,38 +534,140 @@ def gerar_energisa(dados):
 # ============================================================
 def form_equatorial():
     st.header("Equatorial-GO")
+
+    exemplo_go = """nome: Nome Completo do Cliente
+cpf_cnpj: 000.000.000-00
+celular: 66 99999-9999
+endereco: Rua Exemplo, 100
+email: cliente@email.com
+cep: 76240000
+municipio: Aragarças
+uf: GO
+uc_existente: 0000000000
+tipo_ligacao: MONOFÁSICO
+tensao_atendimento_v: 220
+classe: Residencial
+disjuntor_entrada_a: 50
+carga_declarada_kw: 10
+potencia_disponibilizada_kw: 10
+tipo_ramal: AÉREO
+fuso: 22L
+coord_x: 366000
+coord_y: 8241000
+modalidade_compensacao: AUTOCONSUMO LOCAL
+data_inicio_operacao: Sep 15, 2026
+bairro: Centro
+
+---- Módulos: repita o bloco [modulos] para cada modelo ----
+[modulos]
+potencia_w: 590
+quantidade: 10
+fabricante: LEAPTON
+modelo: LP182-199-M-66-NB-590W
+
+---- Inversores: repita o bloco [inversores] para cada modelo ----
+[inversores]
+fabricante: SOFAR
+modelo: 5KTLM-G3
+potencia_nominal_kw: 5
+faixa_tensao_v: 220
+corrente_nominal_a: 22.7
+fator_potencia: 1.0
+rendimento_pct: 97.5
+dht_corrente_pct: 3"""
+
+    colado_go = campo_colar_dados(exemplo_go, "[modulos], [inversores]")
+
+    if colado_go:
+        st.success("Texto reconhecido! Confira o resumo abaixo antes de gerar.")
+        blocos = colado_go.pop("_blocos", {})
+        modulos = blocos.get("modulos", [])
+        inversores = blocos.get("inversores", [])
+
+        faltando = [c for c in ("nome", "cpf_cnpj") if not colado_go.get(c)]
+        st.write(
+            f"**{colado_go.get('nome','?')}** — CPF/CNPJ {colado_go.get('cpf_cnpj','?')} — "
+            f"{len(modulos)} modelo(s) de módulo, {len(inversores)} modelo(s) de inversor"
+        )
+        with st.expander("Ver dados completos reconhecidos"):
+            st.json({**colado_go, "modulos": modulos, "inversores": inversores})
+
+        if faltando:
+            st.error(f"Faltam campos obrigatórios no texto colado: {', '.join(faltando)}")
+            return
+
+        foto_go = st.file_uploader(
+            "Print do mapa / foto de satélite com a marcação do imóvel (opcional)",
+            type=["png", "jpg", "jpeg"], key="foto_colado_go",
+        )
+
+        if st.button("Gerar documentos a partir do texto colado (Equatorial-GO)", type="primary"):
+            uf_go = colado_go.get("uf", "GO")
+            data_str = colado_go.get("data_inicio_operacao")
+            data_inicio = None
+            if data_str:
+                for fmt in ("%b %d, %Y", "%B %d, %Y", "%d/%m/%Y", "%Y-%m-%d"):
+                    try:
+                        data_inicio = datetime.strptime(str(data_str).strip(), fmt)
+                        break
+                    except ValueError:
+                        continue
+            if not data_inicio:
+                data_inicio = datetime.today() + timedelta(days=15)
+            endereco_go = colado_go.get("endereco", "")
+            bairro_go = colado_go.get("bairro", "")
+
+            dados = {
+                "responsavel_tecnico": {
+                    "nome": "Alex Gomes da Silva", "titulo_profissional": "Engenheiro de Energia",
+                    "registro_profissional": 436143, "uf_registro": "MT",
+                    "email": "alexgomes.eng.energ@gmail.com", "telefone": "66999645914",
+                },
+                "premissas_fixas": {
+                    "tarifa_branca": "NÃO", "vistoria_apos_solicitacao": "NÃO",
+                    "autoriza_entrega_contratos": "SIM", "declara_conformidade_normas": "SIM",
+                    "grid_zero": "NÃO", "gratuidade_ren": "NÃO",
+                    "autoriza_faturas_email": "NÃO", "declara_veracidade": "SIM",
+                },
+                "_referencia_hakknner": REFERENCIA_HAKKNNER,
+                "cliente": {
+                    "nome": colado_go.get("nome", ""), "cpf_cnpj": colado_go.get("cpf_cnpj", ""),
+                    "celular": colado_go.get("celular", ""), "telefone_fixo": "",
+                    "endereco": endereco_go, "email": colado_go.get("email", ""),
+                    "cep": colado_go.get("cep", ""), "municipio": colado_go.get("municipio", "Aragarças"),
+                    "uf": uf_go, "uf_extenso": "Goiás" if uf_go == "GO" else uf_go,
+                    "receber_fatura_email": "NÃO",
+                    "tipo_orcamento": "Orçamento de Conexão",
+                    "uc_existente": colado_go.get("uc_existente", ""),
+                    "tipo_solicitacao": "CONEXÃO DE GD EM UNIDADE CONSUMIDORA EXISTENTE SEM AUMENTO DE POTÊNCIA DISPONIBILIZADA (ver item abaixo)",
+                    "cargas_especiais": "NÃO",
+                    "ramo_atividade": colado_go.get("classe", "Residencial"),
+                    "classe": colado_go.get("classe", "Residencial"),
+                    "tipo_ligacao": colado_go.get("tipo_ligacao", "MONOFÁSICO"),
+                    "tensao_atendimento_v": colado_go.get("tensao_atendimento_v", 220),
+                    "carga_declarada_kw": colado_go.get("carga_declarada_kw", 10),
+                    "disjuntor_entrada_a": colado_go.get("disjuntor_entrada_a", 50),
+                    "potencia_disponibilizada_kw": colado_go.get("potencia_disponibilizada_kw", 10),
+                    "tipo_ramal": colado_go.get("tipo_ramal", "AÉREO"),
+                    "fuso": colado_go.get("fuso", ""), "coord_x": colado_go.get("coord_x", ""),
+                    "coord_y": colado_go.get("coord_y", ""),
+                    "modalidade_compensacao": colado_go.get("modalidade_compensacao", "AUTOCONSUMO LOCAL"),
+                    "data_inicio_operacao": data_inicio.date().isoformat(),
+                    "conta_contrato": colado_go.get("uc_existente", ""), "bairro": bairro_go,
+                    "mes_ano_documento": f"{MES_PT[data_inicio.month-1].capitalize()} – {data_inicio.year}",
+                    "telefone_cliente": colado_go.get("celular", ""),
+                    "data_conclusao_geradora": data_inicio.strftime("%d/%m/%Y"),
+                    "endereco_completo_comissionamento": f"{endereco_go.upper()}\n{bairro_go.upper()}",
+                    "modulos": modulos, "inversores": inversores,
+                },
+            }
+            gerar_equatorial(dados, foto_go)
+        return
+
+    st.divider()
     resp = responsavel_tecnico_form()
     st.caption("Registro Profissional (Anexo I): 436143 · Registro Memorial: 1217762256 (fixos)")
 
-    with st.expander("📄 Já tem os dados prontos? Preencha a partir de um arquivo .txt"):
-        st.caption(
-            "Baixe o modelo, preencha os campos num editor de texto simples "
-            "(Bloco de Notas, etc.) e envie de volta aqui — os documentos são "
-            "gerados direto, sem precisar preencher o formulário abaixo. A foto "
-            "de localização (opcional) continua sendo enviada separadamente logo abaixo."
-        )
-        st.download_button(
-            "⬇️ Baixar modelo (.txt)", TEMPLATE_EQUATORIAL_TXT, "modelo_equatorial.txt",
-            key="modelo_equatorial_txt",
-        )
-        arquivo_txt = st.file_uploader(
-            "Enviar arquivo preenchido (.txt)", type=["txt"], key="upload_equatorial_txt",
-        )
-        foto_txt = st.file_uploader(
-            "Foto de localização (opcional)", type=["png", "jpg", "jpeg"], key="upload_equatorial_foto_txt",
-        )
-        if arquivo_txt is not None:
-            texto = arquivo_txt.getvalue().decode("utf-8", errors="replace")
-            dados_txt = montar_dados_equatorial_de_txt(texto, resp)
-            st.caption("Prévia dos dados lidos do arquivo:")
-            st.json(dados_txt, expanded=False)
-            if st.button("Gerar documentos a partir do arquivo", type="primary", key="gerar_equatorial_txt"):
-                if not dados_txt["cliente"]["nome"] or not dados_txt["cliente"]["cpf_cnpj"]:
-                    st.error("O arquivo precisa ter pelo menos os campos 'nome' e 'cpf_cnpj' preenchidos.")
-                else:
-                    gerar_equatorial(dados_txt, foto_txt)
-
-    st.markdown("---")
     st.subheader("1. Identificação")
     c1, c2, c3 = st.columns(3)
     nome = c1.text_input("Nome completo")
@@ -954,8 +775,6 @@ def form_equatorial():
         }
         gerar_equatorial(dados, foto)
 
-    mostrar_downloads("equatorial_resultado")
-
 
 def gerar_equatorial(dados, foto_upload):
     nome_base = slug_arquivo(dados["cliente"]["nome"], dados["cliente"]["uc_existente"] or "SEMUC")
@@ -1002,23 +821,23 @@ def gerar_equatorial(dados, foto_upload):
             with open(anexo_pdf, "wb") as f:
                 writer.write(f)
 
-        salvar_resultado(
-            "equatorial_resultado",
-            principais=[
-                ("Anexo I (.xlsx)", xlsx_path.name, xlsx_path.read_bytes()),
-                ("Anexo I (.pdf)", anexo_pdf.name, anexo_pdf.read_bytes()),
-                ("Memorial (.docx)", memorial_path.name, memorial_path.read_bytes()),
-                ("Memorial (.pdf)", memorial_path.with_suffix(".pdf").name,
-                 memorial_path.with_suffix(".pdf").read_bytes()),
-                ("Comissionamento (.docx)", comiss_path.name, comiss_path.read_bytes()),
-                ("Comissionamento (.pdf)", comiss_path.with_suffix(".pdf").name,
-                 comiss_path.with_suffix(".pdf").read_bytes()),
-            ],
-            nome_zip=f"{nome_base}_documentos.zip",
-            avisos=avisos,
-            aviso_final="Lembrete: as seções de dimensionamento do Memorial (disjuntor, DPS, "
-                        "aterramento, cabos, levantamento de carga) usam os valores de referência — revise manualmente.",
-        )
+        if avisos:
+            st.warning("⚠️ Checagem de viabilidade do Anexo I:\n" + "\n".join(f"- {a}" for a in avisos))
+        else:
+            st.success("Checagem de viabilidade: OK")
+
+        st.success("Documentos gerados!")
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.download_button("⬇️ Anexo I (.xlsx)", xlsx_path.read_bytes(), xlsx_path.name)
+        c2.download_button("⬇️ Anexo I (.pdf)", anexo_pdf.read_bytes(), anexo_pdf.name)
+        c3.download_button("⬇️ Memorial (.docx)", memorial_path.read_bytes(), memorial_path.name)
+        c4.download_button("⬇️ Memorial (.pdf)", memorial_path.with_suffix(".pdf").read_bytes(),
+                            memorial_path.with_suffix(".pdf").name)
+        c5.download_button("⬇️ Comissionamento (.docx)", comiss_path.read_bytes(), comiss_path.name)
+        c6.download_button("⬇️ Comissionamento (.pdf)", comiss_path.with_suffix(".pdf").read_bytes(),
+                            comiss_path.with_suffix(".pdf").name)
+        st.info("Lembrete: as seções de dimensionamento do Memorial (disjuntor, DPS, "
+                "aterramento, cabos, levantamento de carga) usam os valores de referência — revise manualmente.")
 
 
 # ============================================================
