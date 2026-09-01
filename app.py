@@ -40,6 +40,36 @@ from preencher_docx_equatorial import (
 
 PAGINAS_FINAIS_ENERGISA = ["SOLICITACAO", "RELACAO DE CARGA", "FORMULARIO", "MD-SOLAR", "DU-SOLAR"]
 
+# Campos que, quando ficam em branco, a planilha da Energisa destaca em
+# vermelho pedindo revisão manual (ex: Potência do Trafo). Sempre que um
+# desses campos vier vazio, mostramos um aviso na tela ANTES de gerar os
+# documentos, em vez do usuário só descobrir olhando a planilha pronta.
+# Para adicionar outro campo a essa checagem, basta incluir a chave (igual
+# ao nome usado em dados["cliente"]) e a mensagem de aviso correspondente.
+CAMPOS_ATENCAO_ENERGISA = {
+    "potencia_trafo": (
+        "Potência do Trafo (kVA) não foi informada. A planilha destaca esse "
+        "campo em vermelho quando fica em branco — confirme se este projeto "
+        "realmente dispensa transformador exclusivo antes de enviar."
+    ),
+}
+
+# Mesma ideia para o Anexo I da Equatorial-GO. Ainda não temos nenhum campo
+# confirmado como "fica vermelho se vazio" nesse template — assim que algum
+# for identificado, é só adicionar aqui do mesmo jeito.
+CAMPOS_ATENCAO_EQUATORIAL = {}
+
+
+def avisos_campos_atencao(cliente: dict, campos: dict) -> list:
+    """Devolve as mensagens de aviso para os campos de `campos` que estão
+    vazios em `cliente` (None, string vazia ou só espaços)."""
+    avisos = []
+    for chave, mensagem in campos.items():
+        valor = cliente.get(chave)
+        if valor is None or str(valor).strip() == "":
+            avisos.append(mensagem)
+    return avisos
+
 st.set_page_config(page_title="Gerador GD — Exergia", page_icon="\u2600\ufe0f", layout="wide")
 
 MODELO_ENERGISA = BASE / "memorialgd_1.xlsm"
@@ -337,6 +367,8 @@ tensao_nominal_v: 220"""
                     "necessita_autotrafo": "NÃO", "trafo_exclusivo": "NÃO",
                 },
             }
+            for aviso in avisos_campos_atencao(dados["cliente"], CAMPOS_ATENCAO_ENERGISA):
+                st.warning(f"⚠️ {aviso}")
             gerar_energisa(dados)
         return
 
@@ -469,6 +501,8 @@ tensao_nominal_v: 220"""
                 "necessita_autotrafo": "NÃO", "trafo_exclusivo": "NÃO",
             },
         }
+        for aviso in avisos_campos_atencao(dados["cliente"], CAMPOS_ATENCAO_ENERGISA):
+            st.warning(f"⚠️ {aviso}")
         gerar_energisa(dados)
 
 
@@ -682,6 +716,8 @@ dht_corrente_pct: 3"""
                     "modulos": modulos, "inversores": inversores,
                 },
             }
+            for aviso in avisos_campos_atencao(dados["cliente"], CAMPOS_ATENCAO_EQUATORIAL):
+                st.warning(f"⚠️ {aviso}")
             gerar_equatorial(dados, foto_go)
         return
 
@@ -794,6 +830,8 @@ dht_corrente_pct: 3"""
                 "modulos": modulos, "inversores": inversores,
             },
         }
+        for aviso in avisos_campos_atencao(dados["cliente"], CAMPOS_ATENCAO_EQUATORIAL):
+            st.warning(f"⚠️ {aviso}")
         gerar_equatorial(dados, foto)
 
 
