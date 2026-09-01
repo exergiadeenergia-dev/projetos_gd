@@ -28,6 +28,7 @@ sys.path.insert(0, str(BASE))
 from preencher_gd import preencher as preencher_energisa
 from recalc import recalc as recalc_xlsx
 from office.soffice import run_soffice
+from xml_cell_writer import restringir_impressao_para_pdf
 from preencher_equatorial import preencher as preencher_anexo1
 from preencher_docx_equatorial import (
     replace_everywhere,
@@ -36,6 +37,8 @@ from preencher_docx_equatorial import (
     fix_tabela_gerador,
     substituir_foto_localizacao,
 )
+
+PAGINAS_FINAIS_ENERGISA = ["SOLICITACAO", "RELACAO DE CARGA", "FORMULARIO", "MD-SOLAR", "DU-SOLAR"]
 
 st.set_page_config(page_title="Gerador GD — Exergia", page_icon="\u2600\ufe0f", layout="wide")
 
@@ -199,6 +202,7 @@ def campo_colar_dados(exemplo: str, ajuda_blocos: str) -> dict | None:
 # ============================================================
 def form_energisa():
     st.header("Energisa-MT")
+    mostrar_downloads_energisa()
 
     exemplo = """uc: 74561701723
 classe: RESIDENCIAL
@@ -486,14 +490,13 @@ def gerar_energisa(dados):
             st.warning(f"Atenção: erros encontrados na planilha: {resultado}")
 
         with st.spinner("Gerando PDF..."):
-            import openpyxl
-            wb = openpyxl.load_workbook(str(xlsm_path), keep_vba=True, data_only=False)
-            manter = {"SOLICITACAO", "RELACAO DE CARGA", "FORMULARIO", "MD-SOLAR", "DU-SOLAR"}
-            for nome in wb.sheetnames:
-                if nome not in manter:
-                    wb[nome].print_area = "ZZ9000:ZZ9000"
+            # Cópia só pra imprimir: restringe a área de impressão das demais
+            # abas por edição direta do XML (preserva as formas do diagrama —
+            # NUNCA usar openpyxl aqui, ele apaga os desenhos ao salvar).
             print_path = tmp / f"{nome_base}_print.xlsm"
-            wb.save(str(print_path))
+            import shutil as _shutil
+            _shutil.copyfile(str(xlsm_path), str(print_path))
+            restringir_impressao_para_pdf(str(print_path), PAGINAS_FINAIS_ENERGISA)
 
             run_soffice(["--headless", "--convert-to", "pdf", "--outdir", str(tmp), str(print_path)])
             from pypdf import PdfReader, PdfWriter
@@ -522,11 +525,28 @@ def gerar_energisa(dados):
             aneel_path = tmp / f"{nome_base}_ANEEL.xlsx"
             wb_out.save(str(aneel_path))
 
-        st.success("Documentos gerados!")
-        c1, c2, c3 = st.columns(3)
-        c1.download_button("⬇️ Planilha (.xlsm)", xlsm_path.read_bytes(), xlsm_path.name)
-        c2.download_button("⬇️ PDF final", pdf_final.read_bytes(), pdf_final.name)
-        c3.download_button("⬇️ Arquivo ANEEL", aneel_path.read_bytes(), aneel_path.name)
+        # Guarda os bytes na sessão (não nos caminhos!) — a pasta temporária
+        # é apagada assim que sairmos deste bloco, e clicar num botão de
+        # download recarrega a página. Sem isso, os botões (e os arquivos)
+        # somem depois do primeiro clique.
+        st.session_state["saida_energisa"] = {
+            "xlsm_bytes": xlsm_path.read_bytes(), "xlsm_nome": xlsm_path.name,
+            "pdf_bytes": pdf_final.read_bytes(), "pdf_nome": pdf_final.name,
+            "aneel_bytes": aneel_path.read_bytes(), "aneel_nome": aneel_path.name,
+        }
+
+    mostrar_downloads_energisa()
+
+
+def mostrar_downloads_energisa():
+    saida = st.session_state.get("saida_energisa")
+    if not saida:
+        return
+    st.success("Documentos gerados!")
+    c1, c2, c3 = st.columns(3)
+    c1.download_button("⬇️ Planilha (.xlsm)", saida["xlsm_bytes"], saida["xlsm_nome"], key="dl_xlsm_energisa")
+    c2.download_button("⬇️ PDF final", saida["pdf_bytes"], saida["pdf_nome"], key="dl_pdf_energisa")
+    c3.download_button("⬇️ Arquivo ANEEL", saida["aneel_bytes"], saida["aneel_nome"], key="dl_aneel_energisa")
 
 
 # ============================================================
@@ -534,6 +554,7 @@ def gerar_energisa(dados):
 # ============================================================
 def form_equatorial():
     st.header("Equatorial-GO")
+    mostrar_downloads_equatorial()
 
     exemplo_go = """nome: Nome Completo do Cliente
 cpf_cnpj: 000.000.000-00
@@ -821,23 +842,42 @@ def gerar_equatorial(dados, foto_upload):
             with open(anexo_pdf, "wb") as f:
                 writer.write(f)
 
-        if avisos:
-            st.warning("⚠️ Checagem de viabilidade do Anexo I:\n" + "\n".join(f"- {a}" for a in avisos))
-        else:
-            st.success("Checagem de viabilidade: OK")
+        # Guarda os bytes na sessão (a pasta temporária é apagada ao sair
+        # deste bloco, e clicar num botão de download recarrega a página).
+        st.session_state["saida_equatorial"] = {
+            "avisos": avisos,
+            "anexo_xlsx_bytes": xlsx_path.read_bytes(), "anexo_xlsx_nome": xlsx_path.name,
+            "anexo_pdf_bytes": anexo_pdf.read_bytes(), "anexo_pdf_nome": anexo_pdf.name,
+            "memorial_docx_bytes": memorial_path.read_bytes(), "memorial_docx_nome": memorial_path.name,
+            "memorial_pdf_bytes": memorial_path.with_suffix(".pdf").read_bytes(),
+            "memorial_pdf_nome": memorial_path.with_suffix(".pdf").name,
+            "comiss_docx_bytes": comiss_path.read_bytes(), "comiss_docx_nome": comiss_path.name,
+            "comiss_pdf_bytes": comiss_path.with_suffix(".pdf").read_bytes(),
+            "comiss_pdf_nome": comiss_path.with_suffix(".pdf").name,
+        }
 
-        st.success("Documentos gerados!")
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.download_button("⬇️ Anexo I (.xlsx)", xlsx_path.read_bytes(), xlsx_path.name)
-        c2.download_button("⬇️ Anexo I (.pdf)", anexo_pdf.read_bytes(), anexo_pdf.name)
-        c3.download_button("⬇️ Memorial (.docx)", memorial_path.read_bytes(), memorial_path.name)
-        c4.download_button("⬇️ Memorial (.pdf)", memorial_path.with_suffix(".pdf").read_bytes(),
-                            memorial_path.with_suffix(".pdf").name)
-        c5.download_button("⬇️ Comissionamento (.docx)", comiss_path.read_bytes(), comiss_path.name)
-        c6.download_button("⬇️ Comissionamento (.pdf)", comiss_path.with_suffix(".pdf").read_bytes(),
-                            comiss_path.with_suffix(".pdf").name)
-        st.info("Lembrete: as seções de dimensionamento do Memorial (disjuntor, DPS, "
-                "aterramento, cabos, levantamento de carga) usam os valores de referência — revise manualmente.")
+    mostrar_downloads_equatorial()
+
+
+def mostrar_downloads_equatorial():
+    saida = st.session_state.get("saida_equatorial")
+    if not saida:
+        return
+    if saida["avisos"]:
+        st.warning("⚠️ Checagem de viabilidade do Anexo I:\n" + "\n".join(f"- {a}" for a in saida["avisos"]))
+    else:
+        st.success("Checagem de viabilidade: OK")
+
+    st.success("Documentos gerados!")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.download_button("⬇️ Anexo I (.xlsx)", saida["anexo_xlsx_bytes"], saida["anexo_xlsx_nome"], key="dl_anexo_xlsx")
+    c2.download_button("⬇️ Anexo I (.pdf)", saida["anexo_pdf_bytes"], saida["anexo_pdf_nome"], key="dl_anexo_pdf")
+    c3.download_button("⬇️ Memorial (.docx)", saida["memorial_docx_bytes"], saida["memorial_docx_nome"], key="dl_mem_docx")
+    c4.download_button("⬇️ Memorial (.pdf)", saida["memorial_pdf_bytes"], saida["memorial_pdf_nome"], key="dl_mem_pdf")
+    c5.download_button("⬇️ Comissionamento (.docx)", saida["comiss_docx_bytes"], saida["comiss_docx_nome"], key="dl_com_docx")
+    c6.download_button("⬇️ Comissionamento (.pdf)", saida["comiss_pdf_bytes"], saida["comiss_pdf_nome"], key="dl_com_pdf")
+    st.info("Lembrete: as seções de dimensionamento do Memorial (disjuntor, DPS, "
+            "aterramento, cabos, levantamento de carga) usam os valores de referência — revise manualmente.")
 
 
 # ============================================================
