@@ -98,6 +98,19 @@ def _num(defaults: dict, campo: str, padrao):
         return padrao
 
 
+def caixa_fonte_inmetro():
+    """Lembrete + links oficiais do INMETRO pra achar marca/modelo exatos
+    de módulo e inversor. O app nunca escolhe um modelo sozinho — o
+    engenheiro sempre confirma o modelo certificado antes de gerar os
+    documentos; a única automação aqui é apontar pra fonte certa."""
+    st.caption(
+        "📋 Marca e modelo de módulo/inversor **sempre são conferidos e confirmados por você** "
+        "— o app não escolhe isso sozinho. Use as tabelas oficiais do INMETRO como fonte para "
+        f"achar o modelo certificado a partir da potência: [tabela de módulos fotovoltaicos]({drive_cliente.INMETRO_MODULOS_URL}) · "
+        f"[tabela de inversores on-grid]({drive_cliente.INMETRO_INVERSORES_ONGRID_URL})."
+    )
+
+
 def _idx(opcoes: list, valor, padrao: int = 0) -> int:
     """Índice de `valor` dentro de `opcoes` pra pré-selecionar um
     selectbox a partir de um dado vindo do levantamento automático do
@@ -261,6 +274,7 @@ def campo_colar_dados(exemplo: str, ajuda_blocos: str) -> dict | None:
             "Cole os dados no formato `chave: valor`, um por linha. "
             f"Use blocos repetíveis pra listas: {ajuda_blocos}"
         )
+        caixa_fonte_inmetro()
         st.code(exemplo, language="text")
         texto = st.text_area("Cole aqui", height=200, key="colar_" + ajuda_blocos[:10])
     if texto and texto.strip():
@@ -630,8 +644,7 @@ tensao_nominal_v: 220"""
     gd_ja_instalado = c3.selectbox("Sistema GD já instalado?", ["SIM", "NÃO"])
 
     st.subheader("6. Painéis")
-    st.caption("O levantamento do Drive não tenta adivinhar marca/modelo de equipamento — "
-               "preencha aqui (dica: consulte o registro do INMETRO pela potência informada).")
+    caixa_fonte_inmetro()
     paineis = tabela_equipamentos(
         "Um item por modelo de painel diferente",
         None,
@@ -973,6 +986,7 @@ dht_corrente_pct: 3"""
     data_inicio = c2.date_input("Data de início de operação", value=date.today() + timedelta(days=15))
 
     st.subheader("4. Módulos")
+    caixa_fonte_inmetro()
     modulos = tabela_equipamentos(
         "Um item por modelo de módulo diferente",
         None,
