@@ -10,11 +10,13 @@ Rodar localmente:
 Publicar (acesso pelo navegador de qualquer lugar):
     Veja instruções no LEIA-ME.md
 """
+import io
 import json
 import re
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from datetime import date, datetime, timedelta
 
@@ -37,6 +39,7 @@ from preencher_docx_equatorial import (
     fix_tabela_gerador,
     substituir_foto_localizacao,
 )
+import drive_cliente
 
 PAGINAS_FINAIS_ENERGISA = ["SOLICITACAO", "RELACAO DE CARGA", "FORMULARIO", "MD-SOLAR", "DU-SOLAR"]
 
@@ -69,6 +72,44 @@ def avisos_campos_atencao(cliente: dict, campos: dict) -> list:
         if valor is None or str(valor).strip() == "":
             avisos.append(mensagem)
     return avisos
+
+
+def zip_de_arquivos(itens: list) -> bytes:
+    """Monta um .zip em memória a partir de uma lista de (nome, bytes)."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        for nome, conteudo in itens:
+            z.writestr(nome, conteudo)
+    return buffer.getvalue()
+
+
+def _num(defaults: dict, campo: str, padrao):
+    """Lê um valor numérico de `defaults` (que pode vir como string, já
+    que o quadro de conferência do Drive edita tudo como texto) devolvendo
+    `padrao` (int ou float, conforme o tipo de `padrao`) se não der pra
+    converter."""
+    valor = defaults.get(campo)
+    if valor is None or str(valor).strip() == "":
+        return padrao
+    try:
+        convertido = float(str(valor).replace(",", "."))
+        return int(convertido) if isinstance(padrao, int) else convertido
+    except ValueError:
+        return padrao
+
+
+def _idx(opcoes: list, valor, padrao: int = 0) -> int:
+    """Índice de `valor` dentro de `opcoes` pra pré-selecionar um
+    selectbox a partir de um dado vindo do levantamento automático do
+    Drive; devolve `padrao` se o valor não bater com nenhuma opção."""
+    if valor is None:
+        return padrao
+    valor_norm = str(valor).strip().upper()
+    for i, opcao in enumerate(opcoes):
+        if str(opcao).strip().upper() == valor_norm:
+            return i
+    return padrao
+
 
 st.set_page_config(page_title="Gerador GD — Exergia", page_icon="\u2600\ufe0f", layout="wide")
 
@@ -228,11 +269,140 @@ def campo_colar_dados(exemplo: str, ajuda_blocos: str) -> dict | None:
 
 
 # ============================================================
+# GOOGLE DRIVE — levantamento automático de dados
+# ============================================================
+NOME_TIPO = {"energisa": "Energisa-MT", "equatorial": "Equatorial-GO"}
+
+# de campo do levantamento (dict `campos` do drive_cliente) -> chave usada
+# nos widgets do formulário manual de cada concessionária. Onde o nome é
+# igual dos dois lados a entrada nem precisa aparecer aqui.
+MAPA_CAMPOS_EQUATORIAL = {
+    "titular": "nome",
+    "logradouro": "endereco",
+    "cidade": "municipio",
+    "tipo_conexao": "tipo_ligacao",
+}
+
+
+def _guia_configuracao_drive():
+    st.info(
+        "🔒 A leitura automática do Drive ainda não está configurada neste app. "
+        "Isso é feito uma única vez (veja o passo a passo abaixo) — até lá, use "
+        "normalmente a opção de colar os dados em texto ou o formulário manual."
+    )
+    with st.expander("Como configurar (uma vez só)"):
+        st.markdown(
+            "1. No [Google Cloud Console](https://console.cloud.google.com/), crie um "
+            "projeto (ou use um existente) e ative a **Google Drive API**.\n"
+            "2. Em *Credenciais*, crie uma **Conta de serviço** e gere uma **chave JSON**.\n"
+            "3. No painel do Streamlit Cloud, vá em *Settings → Secrets* e cole o "
+            "conteúdo do JSON sob a chave `[gcp_service_account]` (no formato TOML).\n"
+            "4. No Google Drive, compartilhe a pasta-mãe dos clientes (somente leitura) "
+            "com o e-mail da conta de serviço — algo como "
+            "`nome@seu-projeto.iam.gserviceaccount.com` (está dentro do JSON, campo "
+            "`client_email`).\n\n"
+            "A partir daí o app só enxerga as pastas que forem compartilhadas com essa "
+            "conta — nada além disso, e nunca escreve nada no Drive."
+        )
+
+
+def painel_busca_drive(tipo: str) -> dict:
+    """Mostra a busca da pasta do cliente no Drive + o levantamento
+    automático dos dados em quadros editáveis pra conferência. Devolve um
+    dict de valores prontos pra pré-preencher o formulário manual logo
+    abaixo (vazio se o usuário não usou o Drive nesta sessão)."""
+    chave_resultado = f"drive_resultado_{tipo}"
+    chave_pastas = f"drive_pastas_{tipo}"
+    chave_confirmado = f"drive_confirmado_{tipo}"
+
+    with st.expander(f"🔍 Buscar dados automaticamente no Google Drive ({NOME_TIPO[tipo]})"):
+        if not drive_cliente.servico_disponivel():
+            _guia_configuracao_drive()
+            return st.session_state.get(chave_confirmado, {})
+
+        st.caption(
+            "Digite o nome do cliente (busca pelas pastas compartilhadas com o app) ou "
+            "cole o link da pasta do Drive. O app só lê os arquivos dessa pasta — nada "
+            "é escrito, editado ou apagado no Drive."
+        )
+        busca = st.text_input("Nome do cliente ou link/ID da pasta", key=f"drive_busca_{tipo}")
+
+        if st.button("Buscar no Drive", key=f"drive_btn_buscar_{tipo}"):
+            try:
+                servico = drive_cliente._get_service()
+                if "/" in busca or len(busca) > 40:
+                    pasta_id = drive_cliente.extrair_id_pasta(busca)
+                    meta = servico.files().get(fileId=pasta_id, fields="id, name").execute()
+                    st.session_state[chave_pastas] = [{"id": meta["id"], "name": meta["name"]}]
+                else:
+                    st.session_state[chave_pastas] = drive_cliente.buscar_pastas(servico, busca)
+                if not st.session_state[chave_pastas]:
+                    st.warning("Nenhuma pasta encontrada com esse nome/link.")
+            except Exception as exc:
+                st.error(f"Não consegui acessar o Drive: {exc}")
+
+        pastas = st.session_state.get(chave_pastas, [])
+        if pastas:
+            opcoes = {f"{p['name']} (id: {p['id'][:8]}…)": p["id"] for p in pastas}
+            escolha = st.radio("Pasta encontrada", list(opcoes.keys()), key=f"drive_radio_{tipo}")
+            pasta_id = opcoes[escolha]
+
+            if st.button(f"📥 Fazer levantamento automático — {NOME_TIPO[tipo]}", key=f"drive_btn_levantar_{tipo}"):
+                with st.spinner("Lendo os arquivos da pasta e reconhecendo os dados..."):
+                    try:
+                        resultado = drive_cliente.levantamento_pasta(pasta_id, tipo)
+                        st.session_state[chave_resultado] = resultado
+                    except Exception as exc:
+                        st.error(f"Erro durante o levantamento: {exc}")
+
+        resultado = st.session_state.get(chave_resultado)
+        if resultado:
+            if resultado.arquivos_lidos:
+                st.success("Arquivos lidos: " + ", ".join(resultado.arquivos_lidos))
+            if resultado.arquivos_ignorados:
+                st.caption("Ignorados (sem texto legível ou tipo não suportado): "
+                            + ", ".join(resultado.arquivos_ignorados))
+            for erro in resultado.erros:
+                st.warning(erro)
+
+            if not resultado.campos:
+                st.warning("Não consegui reconhecer nenhum dado nos arquivos dessa pasta. "
+                           "Preencha manualmente abaixo ou use a opção de colar texto.")
+                return st.session_state.get(chave_confirmado, {})
+
+            st.write("**Confira e corrija os valores antes de usar no formulário abaixo** "
+                     "— são um ponto de partida, não confie sem revisar:")
+
+            editado = {}
+            cols = st.columns(3)
+            for i, (campo, valor) in enumerate(sorted(resultado.campos.items())):
+                fonte = resultado.fontes.get(campo, "")
+                novo = cols[i % 3].text_input(
+                    f"{campo}  ·  fonte: {fonte}", value=str(valor), key=f"drive_campo_{tipo}_{campo}",
+                )
+                editado[campo] = novo
+
+            if st.button("✅ Usar estes dados no formulário abaixo", key=f"drive_btn_confirmar_{tipo}", type="primary"):
+                if tipo == "equatorial":
+                    convertido = {}
+                    for campo, valor in editado.items():
+                        convertido[MAPA_CAMPOS_EQUATORIAL.get(campo, campo)] = valor
+                    editado = convertido
+                st.session_state[chave_confirmado] = editado
+                st.success("Dados aplicados! Role até o formulário manual abaixo — os campos já "
+                           "vêm preenchidos, confira mais uma vez antes de gerar os documentos.")
+
+        return st.session_state.get(chave_confirmado, {})
+
+
+# ============================================================
 # ENERGISA-MT
 # ============================================================
 def form_energisa():
     st.header("Energisa-MT")
     mostrar_downloads_energisa()
+
+    defaults = painel_busca_drive("energisa")
 
     exemplo = """uc: 74561701723
 classe: RESIDENCIAL
@@ -373,36 +543,46 @@ tensao_nominal_v: 220"""
         return
 
     st.divider()
+    if defaults:
+        st.caption("💡 Os campos abaixo já vêm preenchidos com os dados confirmados no "
+                   "quadro do Drive acima — revise mais uma vez antes de gerar.")
     resp = responsavel_tecnico_form()
 
     st.subheader("1. Dados da Unidade Consumidora")
     c1, c2, c3 = st.columns(3)
-    uc = c1.text_input("UC")
-    classe = c2.selectbox("Classe", ["RESIDENCIAL", "COMERCIAL", "INDUSTRIAL", "RURAL"])
-    titular = c3.text_input("Titular")
+    uc = c1.text_input("UC", defaults.get("uc", ""))
+    classe = c2.selectbox("Classe", ["RESIDENCIAL", "COMERCIAL", "INDUSTRIAL", "RURAL"],
+                           index=_idx(["RESIDENCIAL", "COMERCIAL", "INDUSTRIAL", "RURAL"], defaults.get("classe")))
+    titular = c3.text_input("Titular", defaults.get("titular", ""))
 
     c1, c2, c3 = st.columns(3)
-    logradouro = c1.text_input("Logradouro")
-    numero = c2.text_input("Número")
-    bairro = c3.text_input("Bairro")
+    logradouro = c1.text_input("Logradouro", defaults.get("logradouro", ""))
+    numero = c2.text_input("Número", defaults.get("numero", ""))
+    bairro = c3.text_input("Bairro", defaults.get("bairro", ""))
 
     c1, c2, c3 = st.columns(3)
-    cidade = c1.text_input("Cidade")
-    uf = c2.text_input("UF", "MT")
-    cep = c3.text_input("CEP")
+    cidade = c1.text_input("Cidade", defaults.get("cidade", ""))
+    uf = c2.text_input("UF", defaults.get("uf", "MT"))
+    cep = c3.text_input("CEP", defaults.get("cep", ""))
 
     c1, c2, c3 = st.columns(3)
-    email = c1.text_input("E-mail", "não informado")
-    celular = c2.text_input("Celular")
-    cpf_cnpj = c3.text_input("CPF/CNPJ")
+    email = c1.text_input("E-mail", defaults.get("email", "não informado"))
+    celular = c2.text_input("Celular", defaults.get("celular", ""))
+    cpf_cnpj = c3.text_input("CPF/CNPJ", defaults.get("cpf_cnpj", ""))
 
     st.subheader("2. Dados da UC no ato da vistoria")
     c1, c2, c3, c4 = st.columns(4)
-    potencia_instalada_kw = c1.number_input("Potência Instalada (kW)", min_value=0.0, step=0.1)
-    tensao_atendimento_v = c2.text_input("Tensão de Atendimento (V)", "220",
+    potencia_instalada_kw = c1.number_input("Potência Instalada (kW)", min_value=0.0, step=0.1,
+                                             value=_num(defaults, "potencia_instalada_kw", 0.0))
+    tensao_atendimento_v = c2.text_input("Tensão de Atendimento (V)",
+                                          defaults.get("tensao_atendimento_v", "220"),
                                           help='Use "220/380" para trifásico em baixa tensão')
-    tipo_conexao = c3.selectbox("Tipo de Conexão", ["MONOFÁSICO", "BIFÁSICO", "TRIFÁSICO"])
-    tipo_ramal = c4.selectbox("Tipo de Ramal", ["AÉREO", "SUBTERRÂNEO"])
+    opcoes_conexao = ["MONOFÁSICO", "BIFÁSICO", "TRIFÁSICO"]
+    tipo_conexao = c3.selectbox("Tipo de Conexão", opcoes_conexao,
+                                 index=_idx(opcoes_conexao, defaults.get("tipo_conexao")))
+    opcoes_ramal = ["AÉREO", "SUBTERRÂNEO"]
+    tipo_ramal = c4.selectbox("Tipo de Ramal", opcoes_ramal,
+                               index=_idx(opcoes_ramal, defaults.get("tipo_ramal")))
 
     st.subheader("3. Relação de Carga")
     cargas = tabela_equipamentos(
@@ -419,34 +599,39 @@ tensao_nominal_v: 220"""
 
     st.subheader("4. Proteções e padrão")
     c1, c2, c3 = st.columns(3)
-    disjuntor_geral_a = c1.number_input("Disjuntor geral (A)", value=50)
-    fator_potencia = c2.number_input("Fator de Potência", value=0.92, step=0.01)
-    demanda_contratada_kw = c3.number_input("Demanda Contratada (kW)", value=0.0)
+    disjuntor_geral_a = c1.number_input("Disjuntor geral (A)", value=_num(defaults, "disjuntor_geral_a", 50))
+    fator_potencia = c2.number_input("Fator de Potência", value=_num(defaults, "fator_potencia", 0.92), step=0.01)
+    demanda_contratada_kw = c3.number_input("Demanda Contratada (kW)", value=_num(defaults, "demanda_contratada_kw", 0.0))
 
     c1, c2, c3, c4 = st.columns(4)
-    dps_ca_ka = c1.number_input("DPS CA (kA)", value=20)
-    disjuntor_ca_a = c2.number_input("Disjuntor CA (A)", value=50)
-    dps_cc_ka = c3.number_input("DPS CC (kA)", value=20)
-    disjuntor_cc_a = c4.number_input("Disjuntor CC (A)", value=32)
+    dps_ca_ka = c1.number_input("DPS CA (kA)", value=_num(defaults, "dps_ca_ka", 20))
+    disjuntor_ca_a = c2.number_input("Disjuntor CA (A)", value=_num(defaults, "disjuntor_ca_a", 50))
+    dps_cc_ka = c3.number_input("DPS CC (kA)", value=_num(defaults, "dps_cc_ka", 20))
+    disjuntor_cc_a = c4.number_input("Disjuntor CC (A)", value=_num(defaults, "disjuntor_cc_a", 32))
 
     c1, c2, c3 = st.columns(3)
-    modalidade = c1.selectbox("Modalidade", ["Autoconsumo remoto", "Autoconsumo local",
-                                              "Geração compartilhada", "Múltiplas UCs"])
-    potencia_trafo = c2.text_input("Potência Trafo (kVA) — deixe em branco se não houver")
-    numero_hastes = c3.number_input("Número de hastes", value=6)
+    opcoes_modalidade = ["Autoconsumo remoto", "Autoconsumo local", "Geração compartilhada", "Múltiplas UCs"]
+    modalidade = c1.selectbox("Modalidade", opcoes_modalidade,
+                               index=_idx(opcoes_modalidade, defaults.get("modalidade")))
+    potencia_trafo = c2.text_input("Potência Trafo (kVA) — deixe em branco se não houver",
+                                    defaults.get("potencia_trafo", ""))
+    numero_hastes = c3.number_input("Número de hastes", value=_num(defaults, "numero_hastes", 6))
 
     st.subheader("5. Coordenadas e previsão de ligação")
     c1, c2, c3 = st.columns(3)
-    fuso = c1.text_input("Fuso (ex: 22L)")
-    coord_x = c2.text_input("X")
-    coord_y = c3.text_input("Y")
+    fuso = c1.text_input("Fuso (ex: 22L)", defaults.get("fuso", ""))
+    coord_x = c2.text_input("X", defaults.get("coord_x", ""))
+    coord_y = c3.text_input("Y", defaults.get("coord_y", ""))
 
     c1, c2, c3 = st.columns(3)
     data_prevista = c1.date_input("Previsão de ligação", value=date.today() + timedelta(days=15))
-    zona = c2.selectbox("Zona", ["URBANO", "RURAL"])
+    opcoes_zona = ["URBANO", "RURAL"]
+    zona = c2.selectbox("Zona", opcoes_zona, index=_idx(opcoes_zona, defaults.get("zona")))
     gd_ja_instalado = c3.selectbox("Sistema GD já instalado?", ["SIM", "NÃO"])
 
     st.subheader("6. Painéis")
+    st.caption("O levantamento do Drive não tenta adivinhar marca/modelo de equipamento — "
+               "preencha aqui (dica: consulte o registro do INMETRO pela potência informada).")
     paineis = tabela_equipamentos(
         "Um item por modelo de painel diferente",
         None,
@@ -577,10 +762,17 @@ def mostrar_downloads_energisa():
     if not saida:
         return
     st.success("Documentos gerados!")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.download_button("⬇️ Planilha (.xlsm)", saida["xlsm_bytes"], saida["xlsm_nome"], key="dl_xlsm_energisa")
     c2.download_button("⬇️ PDF final", saida["pdf_bytes"], saida["pdf_nome"], key="dl_pdf_energisa")
     c3.download_button("⬇️ Arquivo ANEEL", saida["aneel_bytes"], saida["aneel_nome"], key="dl_aneel_energisa")
+    zip_bytes = zip_de_arquivos([
+        (saida["xlsm_nome"], saida["xlsm_bytes"]),
+        (saida["pdf_nome"], saida["pdf_bytes"]),
+        (saida["aneel_nome"], saida["aneel_bytes"]),
+    ])
+    c4.download_button("📦 Baixar tudo (.zip)", zip_bytes, "documentos_energisa.zip",
+                        key="dl_zip_energisa", type="primary")
 
 
 # ============================================================
@@ -589,6 +781,8 @@ def mostrar_downloads_energisa():
 def form_equatorial():
     st.header("Equatorial-GO")
     mostrar_downloads_equatorial()
+
+    defaults = painel_busca_drive("equatorial")
 
     exemplo_go = """nome: Nome Completo do Cliente
 cpf_cnpj: 000.000.000-00
@@ -722,49 +916,60 @@ dht_corrente_pct: 3"""
         return
 
     st.divider()
+    if defaults:
+        st.caption("💡 Os campos abaixo já vêm preenchidos com os dados confirmados no "
+                   "quadro do Drive acima — revise mais uma vez antes de gerar.")
     resp = responsavel_tecnico_form()
     st.caption("Registro Profissional (Anexo I): 436143 · Registro Memorial: 1217762256 (fixos)")
 
     st.subheader("1. Identificação")
     c1, c2, c3 = st.columns(3)
-    nome = c1.text_input("Nome completo")
-    cpf_cnpj = c2.text_input("CPF/CNPJ")
-    celular = c3.text_input("Celular")
+    nome = c1.text_input("Nome completo", defaults.get("nome", ""))
+    cpf_cnpj = c2.text_input("CPF/CNPJ", defaults.get("cpf_cnpj", ""))
+    celular = c3.text_input("Celular", defaults.get("celular", ""))
 
     c1, c2 = st.columns(2)
-    endereco = c1.text_input("Endereço (rua, número, complemento)")
-    email = c2.text_input("E-mail")
+    endereco = c1.text_input("Endereço (rua, número, complemento)", defaults.get("endereco", ""))
+    email = c2.text_input("E-mail", defaults.get("email", ""))
 
     c1, c2, c3, c4 = st.columns(4)
-    cep = c1.text_input("CEP", "76240000")
-    municipio = c2.text_input("Município", "Aragarças")
-    uf = c3.text_input("UF", "GO")
-    bairro = c4.text_input("Bairro")
+    cep = c1.text_input("CEP", defaults.get("cep", "76240000"))
+    municipio = c2.text_input("Município", defaults.get("municipio", "Aragarças"))
+    uf = c3.text_input("UF", defaults.get("uf", "GO"))
+    bairro = c4.text_input("Bairro", defaults.get("bairro", ""))
 
-    uc_existente = st.text_input("UC (se já existir)")
+    uc_existente = st.text_input("UC (se já existir)", defaults.get("uc_existente", ""))
 
     st.subheader("2. Características técnicas")
     c1, c2, c3 = st.columns(3)
-    tipo_ligacao = c1.selectbox("Tipo de Ligação", ["MONOFÁSICO", "BIFÁSICO", "TRIFÁSICO"])
-    tensao_atendimento_v = c2.number_input("Tensão de Atendimento (V)", value=220)
-    classe = c3.selectbox("Classe", ["Residencial", "Comercial", "Industrial", "Rural"])
+    opcoes_ligacao = ["MONOFÁSICO", "BIFÁSICO", "TRIFÁSICO"]
+    tipo_ligacao = c1.selectbox("Tipo de Ligação", opcoes_ligacao,
+                                 index=_idx(opcoes_ligacao, defaults.get("tipo_ligacao")))
+    tensao_atendimento_v = c2.number_input("Tensão de Atendimento (V)",
+                                            value=_num(defaults, "tensao_atendimento_v", 220))
+    opcoes_classe = ["Residencial", "Comercial", "Industrial", "Rural"]
+    classe = c3.selectbox("Classe", opcoes_classe, index=_idx(opcoes_classe, defaults.get("classe")))
 
     c1, c2, c3 = st.columns(3)
-    disjuntor_entrada_a = c1.number_input("Disjuntor de Entrada (A)", value=50)
-    carga_declarada_kw = c2.number_input("Carga Declarada (kW)", value=10.0)
-    potencia_disponibilizada_kw = c3.number_input("Potência Disponibilizada — PD (kW)", value=10.0)
+    disjuntor_entrada_a = c1.number_input("Disjuntor de Entrada (A)", value=_num(defaults, "disjuntor_entrada_a", 50))
+    carga_declarada_kw = c2.number_input("Carga Declarada (kW)", value=_num(defaults, "carga_declarada_kw", 10.0))
+    potencia_disponibilizada_kw = c3.number_input("Potência Disponibilizada — PD (kW)",
+                                                    value=_num(defaults, "potencia_disponibilizada_kw", 10.0))
 
-    tipo_ramal = st.selectbox("Tipo de Ramal", ["AÉREO", "SUBTERRÂNEO"])
+    opcoes_ramal_go = ["AÉREO", "SUBTERRÂNEO"]
+    tipo_ramal = st.selectbox("Tipo de Ramal", opcoes_ramal_go,
+                               index=_idx(opcoes_ramal_go, defaults.get("tipo_ramal")))
 
     st.subheader("3. Coordenadas e modalidade")
     c1, c2, c3 = st.columns(3)
-    fuso = c1.text_input("Fuso (ex: 22L)")
-    coord_x = c2.text_input("X")
-    coord_y = c3.text_input("Y")
+    fuso = c1.text_input("Fuso (ex: 22L)", defaults.get("fuso", ""))
+    coord_x = c2.text_input("X", defaults.get("coord_x", ""))
+    coord_y = c3.text_input("Y", defaults.get("coord_y", ""))
 
     c1, c2 = st.columns(2)
-    modalidade_compensacao = c1.selectbox("Modalidade de Compensação",
-                                           ["AUTOCONSUMO LOCAL", "AUTOCONSUMO REMOTO"])
+    opcoes_modalidade_go = ["AUTOCONSUMO LOCAL", "AUTOCONSUMO REMOTO"]
+    modalidade_compensacao = c1.selectbox("Modalidade de Compensação", opcoes_modalidade_go,
+                                           index=_idx(opcoes_modalidade_go, defaults.get("modalidade_compensacao")))
     data_inicio = c2.date_input("Data de início de operação", value=date.today() + timedelta(days=15))
 
     st.subheader("4. Módulos")
@@ -907,13 +1112,23 @@ def mostrar_downloads_equatorial():
         st.success("Checagem de viabilidade: OK")
 
     st.success("Documentos gerados!")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.download_button("⬇️ Anexo I (.xlsx)", saida["anexo_xlsx_bytes"], saida["anexo_xlsx_nome"], key="dl_anexo_xlsx")
     c2.download_button("⬇️ Anexo I (.pdf)", saida["anexo_pdf_bytes"], saida["anexo_pdf_nome"], key="dl_anexo_pdf")
     c3.download_button("⬇️ Memorial (.docx)", saida["memorial_docx_bytes"], saida["memorial_docx_nome"], key="dl_mem_docx")
     c4.download_button("⬇️ Memorial (.pdf)", saida["memorial_pdf_bytes"], saida["memorial_pdf_nome"], key="dl_mem_pdf")
     c5.download_button("⬇️ Comissionamento (.docx)", saida["comiss_docx_bytes"], saida["comiss_docx_nome"], key="dl_com_docx")
     c6.download_button("⬇️ Comissionamento (.pdf)", saida["comiss_pdf_bytes"], saida["comiss_pdf_nome"], key="dl_com_pdf")
+    zip_bytes = zip_de_arquivos([
+        (saida["anexo_xlsx_nome"], saida["anexo_xlsx_bytes"]),
+        (saida["anexo_pdf_nome"], saida["anexo_pdf_bytes"]),
+        (saida["memorial_docx_nome"], saida["memorial_docx_bytes"]),
+        (saida["memorial_pdf_nome"], saida["memorial_pdf_bytes"]),
+        (saida["comiss_docx_nome"], saida["comiss_docx_bytes"]),
+        (saida["comiss_pdf_nome"], saida["comiss_pdf_bytes"]),
+    ])
+    c7.download_button("📦 Baixar tudo (.zip)", zip_bytes, "documentos_equatorial.zip",
+                        key="dl_zip_equatorial", type="primary")
     st.info("Lembrete: as seções de dimensionamento do Memorial (disjuntor, DPS, "
             "aterramento, cabos, levantamento de carga) usam os valores de referência — revise manualmente.")
 
