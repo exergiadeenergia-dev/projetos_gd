@@ -200,9 +200,16 @@ def extrair_dados_genericos(texto: str) -> dict:
         digitos = re.sub(r"\D", "", m.group(1))
         if len(digitos) in (11, 14):
             dados["cpf_cnpj"] = digitos
-    m = re.search(r"CEP\s*[:\-]?\s*(\d{2}\.?\d{3}-?\d{3})", texto, re.IGNORECASE)
-    if m:
+    # CEP solto — mas pulando qualquer ocorrência logo depois da palavra
+    # "Integrador", que em pedidos de kit (ex.: Solfácil) marca o endereço
+    # da PRÓPRIA integradora/revenda, não o do cliente. Pegar esse CEP por
+    # engano seria pior que não achar nenhum: pareceria conferido sem ser.
+    for m in re.finditer(r"CEP\s*[:\-]?\s*(\d{2}\.?\d{3}-?\d{3})", texto, re.IGNORECASE):
+        janela_antes = texto[max(0, m.start() - 200): m.start()]
+        if re.search(r"integrador", janela_antes, re.IGNORECASE):
+            continue
         dados["cep"] = re.sub(r"\D", "", m.group(1))
+        break
     return dados
 
 
@@ -307,7 +314,49 @@ def extrair_coordenadas_livres(texto: str) -> dict:
     return dados
 
 
+def extrair_equipamentos_pedido(texto: str) -> dict:
+    """Quantidade e potência de módulos/inversores num 'Pedido' de kit
+    solar (ex.: Solfácil) — ex.: "15x MODULO BIFACIAL 600W ... Disponível"
+    e "1x INVERSOR 6KW ... 220V ... Disponível". Marca e modelo ficam
+    SEMPRE em branco aqui, de propósito — mesmo aparecendo escritos no
+    pedido, a regra combinada é que marca/modelo de módulo e inversor são
+    sempre conferidos manualmente pelo engenheiro nas tabelas do INMETRO,
+    nunca preenchidos sozinhos pelo app. Só os números objetivos (quantos,
+    quantos W/kW) vêm automáticos.
+
+    Só isso — de propósito. Esse tipo de documento é um pedido de compra
+    junto ao integrador, então ele TEM um "endereço de entrega" e uma
+    "potência do kit", mas nenhum dos dois é confiável como dado do
+    projeto: o endereço de entrega às vezes é diferente de onde o sistema
+    vai ser instalado (pode ser a própria integradora, um depósito etc.),
+    e por isso a gente NUNCA usa esse endereço pros campos de Logradouro/
+    Bairro/Cidade/UF/CEP do formulário — quem manda nisso é a conta de
+    energia (ART/espelho/fatura), não o pedido do kit."""
+    paineis, inversores = [], []
+    for m in re.finditer(
+        r"(\d+)\s*x\s*M[ÓO]DULO\b.*?(\d+)\s*W\b.*?Dispon[íi]vel", texto, re.IGNORECASE | re.DOTALL
+    ):
+        qtd, watts = int(m.group(1)), int(m.group(2))
+        paineis.append({"quantidade": qtd, "fabricante": "", "modelo": "",
+                         "area_m2": 0, "potencia_kw": round(watts / 1000, 3)})
+    for m in re.finditer(
+        r"(\d+)\s*x\s*INVERSOR\b.*?(\d+(?:[.,]\d+)?)\s*KW\b.*?(\d{2,3})\s*V\b.*?Dispon[íi]vel",
+        texto, re.IGNORECASE | re.DOTALL,
+    ):
+        qtd = int(m.group(1))
+        kw = float(m.group(2).replace(",", "."))
+        v = m.group(3)
+        inversores.append({"quantidade": qtd, "fabricante": "", "modelo": "",
+                            "potencia_kw": kw, "tensao_nominal_v": v})
+    return {"paineis": paineis, "inversores": inversores}
+
+
 CAMPOS_TIPO = {
+    # Repare que não tem nenhum extrator de "Pedido de kit solar" aqui — de
+    # propósito. Desse tipo de documento só se aproveita a lista de
+    # equipamentos (via `extrair_equipamentos_pedido`, chamado à parte em
+    # `levantamento_pasta`); endereço/UC/titular sempre vêm da conta de
+    # energia (ART/espelho/fatura), nunca do pedido do kit.
     "energisa": (
         extrair_dados_art, extrair_dados_conta_energisa, extrair_endereco_livre,
         extrair_endereco_bloco_cep, extrair_contato_livre, extrair_coordenadas_livres,
@@ -315,7 +364,8 @@ CAMPOS_TIPO = {
     ),
     "equatorial": (
         extrair_dados_art, extrair_endereco_livre, extrair_endereco_bloco_cep,
-        extrair_contato_livre, extrair_coordenadas_livres, extrair_dados_genericos,
+        extrair_contato_livre, extrair_coordenadas_livres,
+        extrair_dados_genericos,
     ),
 }
 
@@ -548,6 +598,12 @@ class ResultadoLevantamento:
     arquivos_lidos: list = field(default_factory=list)
     arquivos_ignorados: list = field(default_factory=list)
     erros: list = field(default_factory=list)
+    # linhas de equipamento (quantidade/potência; marca/modelo sempre em
+    # branco) achadas em pedidos de kit solar — uma lista por tipo, porque
+    # (ao contrário dos `campos` escalares) pode fazer sentido juntar linhas
+    # de mais de um arquivo/pedido.
+    paineis: list = field(default_factory=list)
+    inversores: list = field(default_factory=list)
 
 
 def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
@@ -581,5 +637,9 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
             if campo not in resultado.campos:
                 resultado.campos[campo] = valor
                 resultado.fontes[campo] = f"{nome} (OCR — confira com atenção redobrada)" if via_ocr else nome
+
+        equipamentos = extrair_equipamentos_pedido(texto)
+        resultado.paineis.extend(equipamentos["paineis"])
+        resultado.inversores.extend(equipamentos["inversores"])
 
     return resultado
