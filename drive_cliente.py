@@ -204,9 +204,35 @@ def extrair_dados_genericos(texto: str) -> dict:
     return dados
 
 
+def extrair_endereco_livre(texto: str) -> dict:
+    """Reconhece uma linha de endereço "solta" (sem rótulo por pedaço),
+    no formato visto nos "espelhos" de conta:
+        LOGRADOURO, NUMERO - BAIRRO - [CIDADE] CEP
+    (o pedaço da cidade é opcional — às vezes não aparece, só o CEP direto
+    depois do segundo traço). Só preenche o que consegue separar com
+    segurança pelas vírgulas/traços; nunca tenta adivinhar onde um pedaço
+    termina e o outro começa se a pontuação não deixar claro."""
+    dados = {}
+    m = re.search(
+        r"\b([A-ZÀ-Ú][A-ZÀ-Ú0-9º°.\s]*?),\s*([A-Z0-9/]+)\s*-\s*([A-ZÀ-Ú0-9º°.\s]+?)\s*-\s*\.?\s*"
+        r"([A-ZÀ-Ú][A-ZÀ-Ú\s]*?)?\s*(\d{5}-?\d{3}|\d{8})\b",
+        texto.upper(),
+    )
+    if not m:
+        return dados
+    logradouro, numero, bairro, cidade, cep = m.groups()
+    dados["logradouro"] = logradouro.strip().title()
+    dados["numero"] = numero.strip()
+    dados["bairro"] = bairro.strip().title()
+    if cidade and cidade.strip():
+        dados["cidade"] = cidade.strip().title()
+    dados["cep"] = re.sub(r"\D", "", cep)
+    return dados
+
+
 CAMPOS_TIPO = {
-    "energisa": (extrair_dados_art, extrair_dados_conta_energisa, extrair_dados_genericos),
-    "equatorial": (extrair_dados_art, extrair_dados_genericos),
+    "energisa": (extrair_dados_art, extrair_dados_conta_energisa, extrair_endereco_livre, extrair_dados_genericos),
+    "equatorial": (extrair_dados_art, extrair_endereco_livre, extrair_dados_genericos),
 }
 
 
@@ -239,6 +265,12 @@ MIME_TEXTO_EXTRAIVEL = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
+# Fotos/prints (foto de documento, print de WhatsApp, nota escaneada) — lidos
+# via OCR. Texto de OCR é mais sujeito a erro que um PDF/Doc digitado, então
+# todo campo achado nesses arquivos fica marcado "(OCR)" na fonte, pra pedir
+# atenção redobrada na conferência.
+MIME_IMAGEM = {"image/jpeg", "image/png"}
+MAX_BYTES_IMAGEM_OCR = 15 * 1024 * 1024  # não roda OCR em foto gigante
 
 MAX_ARQUIVOS = 25
 MAX_PROFUNDIDADE = 3
@@ -318,22 +350,41 @@ def listar_arquivos_pasta(servico, pasta_id: str, _profundidade: int = 0, _total
     return _total
 
 
-def baixar_texto_arquivo(servico, arquivo: dict) -> str:
-    """Baixa/exporta um arquivo e devolve seu texto. Devolve string vazia
-    para tipos que não sabemos extrair texto (imagens, etc.)."""
+def _ocr_imagem(conteudo: bytes) -> str:
+    """OCR de uma foto/print (PIL + pytesseract, português+inglês). Exige
+    `tesseract-ocr` e `tesseract-ocr-por` instalados no sistema (packages.txt)
+    e `pytesseract`+`Pillow` no requirements.txt — se não estiverem
+    disponíveis, propaga a exceção e quem chamou trata como erro do arquivo,
+    sem travar o levantamento dos demais arquivos da pasta."""
+    from PIL import Image
+    import pytesseract
+    img = Image.open(io.BytesIO(conteudo))
+    try:
+        return pytesseract.image_to_string(img, lang="por+eng")
+    except pytesseract.TesseractError:
+        # idioma "por" pode não estar instalado no servidor — tenta só inglês
+        # em vez de falhar o arquivo inteiro.
+        return pytesseract.image_to_string(img, lang="eng")
+
+
+def baixar_texto_arquivo(servico, arquivo: dict) -> tuple[str, bool]:
+    """Baixa/exporta um arquivo e devolve (texto, veio_de_ocr). Devolve
+    string vazia para tipos que não sabemos extrair texto."""
     mime = arquivo["mimeType"]
     file_id = arquivo["id"]
     try:
         if mime == "application/vnd.google-apps.document":
             dados = servico.files().export(fileId=file_id, mimeType="text/plain").execute()
-            return dados.decode("utf-8", errors="ignore") if isinstance(dados, bytes) else str(dados)
+            texto = dados.decode("utf-8", errors="ignore") if isinstance(dados, bytes) else str(dados)
+            return texto, False
 
         if mime == "application/vnd.google-apps.spreadsheet":
             dados = servico.files().export(fileId=file_id, mimeType="text/csv").execute()
-            return dados.decode("utf-8", errors="ignore") if isinstance(dados, bytes) else str(dados)
+            texto = dados.decode("utf-8", errors="ignore") if isinstance(dados, bytes) else str(dados)
+            return texto, False
 
-        if mime not in MIME_TEXTO_EXTRAIVEL:
-            return ""
+        if mime not in MIME_TEXTO_EXTRAIVEL and mime not in MIME_IMAGEM:
+            return "", False
 
         conteudo = servico.files().get_media(fileId=file_id).execute()
 
@@ -343,12 +394,12 @@ def baixar_texto_arquivo(servico, arquivo: dict) -> str:
             partes = []
             for pagina in reader.pages:
                 partes.append(pagina.extract_text() or "")
-            return "\n".join(partes)
+            return "\n".join(partes), False
 
         if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             from docx import Document
             doc = Document(io.BytesIO(conteudo))
-            return "\n".join(p.text for p in doc.paragraphs)
+            return "\n".join(p.text for p in doc.paragraphs), False
 
         if mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
             import openpyxl
@@ -357,12 +408,17 @@ def baixar_texto_arquivo(servico, arquivo: dict) -> str:
             for aba in wb.worksheets:
                 for linha in aba.iter_rows(values_only=True):
                     partes.append(" ".join(str(v) for v in linha if v is not None))
-            return "\n".join(partes)
+            return "\n".join(partes), False
+
+        if mime in MIME_IMAGEM:
+            if len(conteudo) > MAX_BYTES_IMAGEM_OCR:
+                return "", False
+            return _ocr_imagem(conteudo), True
 
     except Exception as exc:  # nunca deixa 1 arquivo problemático travar o levantamento inteiro
-        return f"[erro ao ler {arquivo.get('name')}: {exc}]"
+        return f"[erro ao ler {arquivo.get('name')}: {exc}]", False
 
-    return ""
+    return "", False
 
 
 @dataclass
@@ -386,11 +442,11 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
     arquivos = listar_arquivos_pasta(servico, pasta_id)
     for arquivo in arquivos:
         nome = arquivo["name"]
-        if arquivo["mimeType"] not in MIME_TEXTO_EXTRAIVEL:
+        if arquivo["mimeType"] not in MIME_TEXTO_EXTRAIVEL and arquivo["mimeType"] not in MIME_IMAGEM:
             resultado.arquivos_ignorados.append(nome)
             continue
 
-        texto = baixar_texto_arquivo(servico, arquivo)
+        texto, via_ocr = baixar_texto_arquivo(servico, arquivo)
         if texto.startswith("[erro ao ler"):
             resultado.erros.append(texto)
             continue
@@ -398,12 +454,12 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
             resultado.arquivos_ignorados.append(nome)
             continue
 
-        resultado.arquivos_lidos.append(nome)
+        resultado.arquivos_lidos.append(f"{nome} (OCR)" if via_ocr else nome)
         texto = texto[:MAX_CARACTERES_POR_ARQUIVO]
         achados = extrair_campos_arquivo(texto, tipo)
         for campo, valor in achados.items():
             if campo not in resultado.campos:
                 resultado.campos[campo] = valor
-                resultado.fontes[campo] = nome
+                resultado.fontes[campo] = f"{nome} (OCR — confira com atenção redobrada)" if via_ocr else nome
 
     return resultado

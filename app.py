@@ -324,6 +324,17 @@ MAPA_CAMPOS_EQUATORIAL = {
 }
 
 
+def _remapear_para_equatorial(campos: dict) -> dict:
+    """Aplica MAPA_CAMPOS_EQUATORIAL e junta logradouro+número num só campo
+    "endereco" (o formulário da Equatorial-GO não tem campo separado pra
+    número — é "Endereço (rua, número, complemento)" tudo numa caixa só)."""
+    campos = dict(campos)
+    numero = campos.pop("numero", None)
+    if numero and campos.get("logradouro"):
+        campos["logradouro"] = f"{campos['logradouro']}, {numero}"
+    return {MAPA_CAMPOS_EQUATORIAL.get(c, c): v for c, v in campos.items()}
+
+
 def _guia_configuracao_drive():
     st.info(
         "🔒 A leitura automática do Drive ainda não está configurada neste app. "
@@ -400,7 +411,7 @@ def painel_busca_drive(tipo: str) -> dict:
                         # etapa extra de confirmação aqui em cima.
                         campos = dict(resultado.campos)
                         if tipo == "equatorial":
-                            campos = {MAPA_CAMPOS_EQUATORIAL.get(c, c): v for c, v in campos.items()}
+                            campos = _remapear_para_equatorial(campos)
                         st.session_state[chave_confirmado] = campos
                     except Exception as exc:
                         st.error(f"Erro durante o levantamento: {exc}")
