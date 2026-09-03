@@ -129,6 +129,26 @@ def caixa_fonte_inmetro():
     )
 
 
+def _pendente(defaults: dict, campo: str) -> bool:
+    """True quando esta leitura veio do Drive/colar-texto (defaults não
+    está vazio) mas esse campo específico não foi encontrado — usado só
+    pra destacar o rótulo em vermelho, chamando atenção pra conferir/
+    corrigir sem depender de rolar até o quadro verde ou só descobrir o
+    campo faltando no botão "Gerar documentos"."""
+    return bool(defaults) and not str(defaults.get(campo, "")).strip()
+
+
+def _rotulo(texto: str, campo: str, defaults: dict) -> str:
+    """Rótulo de um campo do formulário manual — fica vermelho com um
+    aviso quando esse dado deveria ter vindo do levantamento automático
+    mas não foi encontrado, pra você confirmar ou corrigir. Só se aplica a
+    dados que a leitura automática realmente tenta reconhecer; os demais
+    (padrões de engenharia, campos opcionais) mantêm o rótulo normal."""
+    if _pendente(defaults, campo):
+        return f":red[{texto} ⚠️ não encontrado]"
+    return texto
+
+
 def _idx(opcoes: list, valor, padrao: int = 0) -> int:
     """Índice de `valor` dentro de `opcoes` pra pré-selecionar um
     selectbox a partir de um dado vindo do levantamento automático do
@@ -613,40 +633,43 @@ tensao_nominal_v: 220"""
     st.divider()
     if defaults:
         st.caption("💡 Os campos abaixo já vêm preenchidos com os dados confirmados no "
-                   "quadro do Drive acima — revise mais uma vez antes de gerar.")
+                   "quadro do Drive acima — revise mais uma vez antes de gerar. Os campos "
+                   "em :red[vermelho] são os que a leitura automática não conseguiu "
+                   "encontrar — preencha ou corrija olhando o documento original.")
     resp = responsavel_tecnico_form()
 
     st.subheader("1. Dados da Unidade Consumidora")
     c1, c2, c3 = st.columns(3)
-    uc = c1.text_input("UC", defaults.get("uc", ""))
+    uc = c1.text_input(_rotulo("UC", "uc", defaults), defaults.get("uc", ""))
     classe = c2.selectbox("Classe", ["RESIDENCIAL", "COMERCIAL", "INDUSTRIAL", "RURAL"],
                            index=_idx(["RESIDENCIAL", "COMERCIAL", "INDUSTRIAL", "RURAL"], defaults.get("classe")))
-    titular = c3.text_input("Titular", defaults.get("titular", ""))
+    titular = c3.text_input(_rotulo("Titular", "titular", defaults), defaults.get("titular", ""))
 
     c1, c2, c3 = st.columns(3)
-    logradouro = c1.text_input("Logradouro", defaults.get("logradouro", ""))
-    numero = c2.text_input("Número", defaults.get("numero", ""))
-    bairro = c3.text_input("Bairro", defaults.get("bairro", ""))
+    logradouro = c1.text_input(_rotulo("Logradouro", "logradouro", defaults), defaults.get("logradouro", ""))
+    numero = c2.text_input(_rotulo("Número", "numero", defaults), defaults.get("numero", ""))
+    bairro = c3.text_input(_rotulo("Bairro", "bairro", defaults), defaults.get("bairro", ""))
 
     c1, c2, c3 = st.columns(3)
-    cidade = c1.text_input("Cidade", defaults.get("cidade", ""))
-    uf = c2.text_input("UF", _txt(defaults, "uf", "MT"))
-    cep = c3.text_input("CEP", defaults.get("cep", ""))
+    cidade = c1.text_input(_rotulo("Cidade", "cidade", defaults), defaults.get("cidade", ""))
+    uf = c2.text_input(_rotulo("UF", "uf", defaults), _txt(defaults, "uf", "MT"))
+    cep = c3.text_input(_rotulo("CEP", "cep", defaults), defaults.get("cep", ""))
 
     c1, c2, c3 = st.columns(3)
     email = c1.text_input("E-mail", defaults.get("email", "não informado"))
     celular = c2.text_input("Celular", defaults.get("celular", ""))
-    cpf_cnpj = c3.text_input("CPF/CNPJ", defaults.get("cpf_cnpj", ""))
+    cpf_cnpj = c3.text_input(_rotulo("CPF/CNPJ", "cpf_cnpj", defaults), defaults.get("cpf_cnpj", ""))
 
     st.subheader("2. Dados da UC no ato da vistoria")
     c1, c2, c3, c4 = st.columns(4)
-    potencia_instalada_kw = c1.number_input("Potência Instalada (kW)", min_value=0.0, step=0.1,
+    potencia_instalada_kw = c1.number_input(_rotulo("Potência Instalada (kW)", "potencia_instalada_kw", defaults),
+                                             min_value=0.0, step=0.1,
                                              value=_num(defaults, "potencia_instalada_kw", 0.0))
-    tensao_atendimento_v = c2.text_input("Tensão de Atendimento (V)",
+    tensao_atendimento_v = c2.text_input(_rotulo("Tensão de Atendimento (V)", "tensao_atendimento_v", defaults),
                                           _txt(defaults, "tensao_atendimento_v", "220"),
                                           help='Use "220/380" para trifásico em baixa tensão')
     opcoes_conexao = ["MONOFÁSICO", "BIFÁSICO", "TRIFÁSICO"]
-    tipo_conexao = c3.selectbox("Tipo de Conexão", opcoes_conexao,
+    tipo_conexao = c3.selectbox(_rotulo("Tipo de Conexão", "tipo_conexao", defaults), opcoes_conexao,
                                  index=_idx(opcoes_conexao, defaults.get("tipo_conexao")))
     opcoes_ramal = ["AÉREO", "SUBTERRÂNEO"]
     tipo_ramal = c4.selectbox("Tipo de Ramal", opcoes_ramal,
@@ -687,14 +710,14 @@ tensao_nominal_v: 220"""
 
     st.subheader("5. Coordenadas e previsão de ligação")
     c1, c2, c3 = st.columns(3)
-    fuso = c1.text_input("Fuso (ex: 22L)", defaults.get("fuso", ""))
-    coord_x = c2.text_input("X", defaults.get("coord_x", ""))
-    coord_y = c3.text_input("Y", defaults.get("coord_y", ""))
+    fuso = c1.text_input(_rotulo("Fuso (ex: 22L)", "fuso", defaults), defaults.get("fuso", ""))
+    coord_x = c2.text_input(_rotulo("X", "coord_x", defaults), defaults.get("coord_x", ""))
+    coord_y = c3.text_input(_rotulo("Y", "coord_y", defaults), defaults.get("coord_y", ""))
 
     c1, c2, c3 = st.columns(3)
     data_prevista = c1.date_input("Previsão de ligação", value=date.today() + timedelta(days=15))
     opcoes_zona = ["URBANO", "RURAL"]
-    zona = c2.selectbox("Zona", opcoes_zona, index=_idx(opcoes_zona, defaults.get("zona")))
+    zona = c2.selectbox(_rotulo("Zona", "zona", defaults), opcoes_zona, index=_idx(opcoes_zona, defaults.get("zona")))
     gd_ja_instalado = c3.selectbox("Sistema GD já instalado?", ["SIM", "NÃO"])
 
     st.subheader("6. Painéis")
@@ -985,25 +1008,27 @@ dht_corrente_pct: 3"""
     st.divider()
     if defaults:
         st.caption("💡 Os campos abaixo já vêm preenchidos com os dados confirmados no "
-                   "quadro do Drive acima — revise mais uma vez antes de gerar.")
+                   "quadro do Drive acima — revise mais uma vez antes de gerar. Os campos "
+                   "em :red[vermelho] são os que a leitura automática não conseguiu "
+                   "encontrar — preencha ou corrija olhando o documento original.")
     resp = responsavel_tecnico_form()
     st.caption("Registro Profissional (Anexo I): 436143 · Registro Memorial: 1217762256 (fixos)")
 
     st.subheader("1. Identificação")
     c1, c2, c3 = st.columns(3)
-    nome = c1.text_input("Nome completo", defaults.get("nome", ""))
-    cpf_cnpj = c2.text_input("CPF/CNPJ", defaults.get("cpf_cnpj", ""))
+    nome = c1.text_input(_rotulo("Nome completo", "nome", defaults), defaults.get("nome", ""))
+    cpf_cnpj = c2.text_input(_rotulo("CPF/CNPJ", "cpf_cnpj", defaults), defaults.get("cpf_cnpj", ""))
     celular = c3.text_input("Celular", defaults.get("celular", ""))
 
     c1, c2 = st.columns(2)
-    endereco = c1.text_input("Endereço (rua, número, complemento)", defaults.get("endereco", ""))
+    endereco = c1.text_input(_rotulo("Endereço (rua, número, complemento)", "endereco", defaults), defaults.get("endereco", ""))
     email = c2.text_input("E-mail", defaults.get("email", ""))
 
     c1, c2, c3, c4 = st.columns(4)
-    cep = c1.text_input("CEP", _txt(defaults, "cep", "76240000"))
-    municipio = c2.text_input("Município", _txt(defaults, "municipio", "Aragarças"))
-    uf = c3.text_input("UF", _txt(defaults, "uf", "GO"))
-    bairro = c4.text_input("Bairro", defaults.get("bairro", ""))
+    cep = c1.text_input(_rotulo("CEP", "cep", defaults), _txt(defaults, "cep", "76240000"))
+    municipio = c2.text_input(_rotulo("Município", "municipio", defaults), _txt(defaults, "municipio", "Aragarças"))
+    uf = c3.text_input(_rotulo("UF", "uf", defaults), _txt(defaults, "uf", "GO"))
+    bairro = c4.text_input(_rotulo("Bairro", "bairro", defaults), defaults.get("bairro", ""))
 
     uc_existente = st.text_input("UC (se já existir)", defaults.get("uc_existente", ""))
 
@@ -1029,9 +1054,9 @@ dht_corrente_pct: 3"""
 
     st.subheader("3. Coordenadas e modalidade")
     c1, c2, c3 = st.columns(3)
-    fuso = c1.text_input("Fuso (ex: 22L)", defaults.get("fuso", ""))
-    coord_x = c2.text_input("X", defaults.get("coord_x", ""))
-    coord_y = c3.text_input("Y", defaults.get("coord_y", ""))
+    fuso = c1.text_input(_rotulo("Fuso (ex: 22L)", "fuso", defaults), defaults.get("fuso", ""))
+    coord_x = c2.text_input(_rotulo("X", "coord_x", defaults), defaults.get("coord_x", ""))
+    coord_y = c3.text_input(_rotulo("Y", "coord_y", defaults), defaults.get("coord_y", ""))
 
     c1, c2 = st.columns(2)
     opcoes_modalidade_go = ["AUTOCONSUMO LOCAL", "AUTOCONSUMO REMOTO"]
