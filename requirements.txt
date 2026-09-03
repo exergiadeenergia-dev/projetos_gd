@@ -5,3 +5,5 @@ python-docx
 pypdf
 google-api-python-client
 google-auth
+pytesseract
+Pillow
