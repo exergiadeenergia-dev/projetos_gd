@@ -129,22 +129,28 @@ def caixa_fonte_inmetro():
     )
 
 
-def _pendente(defaults: dict, campo: str) -> bool:
+def _pendente(key: str, defaults: dict, campo: str) -> bool:
     """True quando esta leitura veio do Drive/colar-texto (defaults não
-    está vazio) mas esse campo específico não foi encontrado — usado só
-    pra destacar o rótulo em vermelho, chamando atenção pra conferir/
-    corrigir sem depender de rolar até o quadro verde ou só descobrir o
-    campo faltando no botão "Gerar documentos"."""
-    return bool(defaults) and not str(defaults.get(campo, "")).strip()
+    está vazio) e o campo continua vazio — mas olhando o valor ATUAL do
+    próprio campo na tela (via `key`, que é estável entre reruns), não só
+    o valor que veio do Drive. É por isso que a mensagem some assim que
+    você digita ou corrige o campo, sem precisar de um novo levantamento:
+    o widget já existe em `st.session_state[key]` com o que você acabou de
+    digitar antes desse rerun começar."""
+    if not defaults:
+        return False
+    valor_atual = st.session_state.get(key, defaults.get(campo, ""))
+    return not str(valor_atual).strip()
 
 
-def _rotulo(texto: str, campo: str, defaults: dict) -> str:
+def _rotulo(texto: str, campo: str, defaults: dict, key: str) -> str:
     """Rótulo de um campo do formulário manual — fica vermelho com um
-    aviso quando esse dado deveria ter vindo do levantamento automático
-    mas não foi encontrado, pra você confirmar ou corrigir. Só se aplica a
-    dados que a leitura automática realmente tenta reconhecer; os demais
+    aviso enquanto esse dado deveria ter vindo do levantamento automático
+    mas continua vazio, e volta ao normal assim que você preenche ou
+    corrige (mesmo sem fazer um novo levantamento). Só se aplica a dados
+    que a leitura automática realmente tenta reconhecer; os demais
     (padrões de engenharia, campos opcionais) mantêm o rótulo normal."""
-    if _pendente(defaults, campo):
+    if _pendente(key, defaults, campo):
         return f":red[{texto} ⚠️ não encontrado]"
     return texto
 
@@ -454,6 +460,14 @@ def painel_busca_drive(tipo: str) -> dict:
                         if tipo == "equatorial":
                             campos = _remapear_para_equatorial(campos)
                         st.session_state[chave_confirmado] = campos
+                        # nova "versão" de leitura: os campos do formulário
+                        # abaixo usam isso na key pra nascer de novo com os
+                        # valores atuais (mesmo que o usuário já tivesse
+                        # digitado algo de uma leitura anterior/outro
+                        # cliente) — mas sem depender do rótulo (que muda de
+                        # cor), então digitar num campo não reseta ele.
+                        chave_versao = f"drive_versao_{tipo}"
+                        st.session_state[chave_versao] = st.session_state.get(chave_versao, 0) + 1
                     except Exception as exc:
                         st.error(f"Erro durante o levantamento: {exc}")
 
@@ -491,6 +505,14 @@ def form_energisa():
     mostrar_downloads_energisa()
 
     defaults = painel_busca_drive("energisa")
+    _versao_energisa = st.session_state.get("drive_versao_energisa", 0)
+
+    def _k(campo: str) -> str:
+        """Key estável do campo pro rerun (não depende do rótulo, que pode
+        ficar vermelho/normal) — só muda quando um NOVO levantamento
+        automático roda, pra puxar os valores lidos de um cliente novo sem
+        ficar preso no que foi digitado pro cliente anterior."""
+        return f"campo_{campo}_energisa_v{_versao_energisa}"
 
     exemplo = """uc: 74561701723
 classe: RESIDENCIAL
@@ -640,37 +662,39 @@ tensao_nominal_v: 220"""
 
     st.subheader("1. Dados da Unidade Consumidora")
     c1, c2, c3 = st.columns(3)
-    uc = c1.text_input(_rotulo("UC", "uc", defaults), defaults.get("uc", ""))
+    uc = c1.text_input(_rotulo("UC", "uc", defaults, _k("uc")), defaults.get("uc", ""), key=_k("uc"))
     classe = c2.selectbox("Classe", ["RESIDENCIAL", "COMERCIAL", "INDUSTRIAL", "RURAL"],
                            index=_idx(["RESIDENCIAL", "COMERCIAL", "INDUSTRIAL", "RURAL"], defaults.get("classe")))
-    titular = c3.text_input(_rotulo("Titular", "titular", defaults), defaults.get("titular", ""))
+    titular = c3.text_input(_rotulo("Titular", "titular", defaults, _k("titular")), defaults.get("titular", ""), key=_k("titular"))
 
     c1, c2, c3 = st.columns(3)
-    logradouro = c1.text_input(_rotulo("Logradouro", "logradouro", defaults), defaults.get("logradouro", ""))
-    numero = c2.text_input(_rotulo("Número", "numero", defaults), defaults.get("numero", ""))
-    bairro = c3.text_input(_rotulo("Bairro", "bairro", defaults), defaults.get("bairro", ""))
+    logradouro = c1.text_input(_rotulo("Logradouro", "logradouro", defaults, _k("logradouro")), defaults.get("logradouro", ""), key=_k("logradouro"))
+    numero = c2.text_input(_rotulo("Número", "numero", defaults, _k("numero")), defaults.get("numero", ""), key=_k("numero"))
+    bairro = c3.text_input(_rotulo("Bairro", "bairro", defaults, _k("bairro")), defaults.get("bairro", ""), key=_k("bairro"))
 
     c1, c2, c3 = st.columns(3)
-    cidade = c1.text_input(_rotulo("Cidade", "cidade", defaults), defaults.get("cidade", ""))
-    uf = c2.text_input(_rotulo("UF", "uf", defaults), _txt(defaults, "uf", "MT"))
-    cep = c3.text_input(_rotulo("CEP", "cep", defaults), defaults.get("cep", ""))
+    cidade = c1.text_input(_rotulo("Cidade", "cidade", defaults, _k("cidade")), defaults.get("cidade", ""), key=_k("cidade"))
+    uf = c2.text_input(_rotulo("UF", "uf", defaults, _k("uf")), _txt(defaults, "uf", "MT"), key=_k("uf"))
+    cep = c3.text_input(_rotulo("CEP", "cep", defaults, _k("cep")), defaults.get("cep", ""), key=_k("cep"))
 
     c1, c2, c3 = st.columns(3)
-    email = c1.text_input("E-mail", defaults.get("email", "não informado"))
-    celular = c2.text_input("Celular", defaults.get("celular", ""))
-    cpf_cnpj = c3.text_input(_rotulo("CPF/CNPJ", "cpf_cnpj", defaults), defaults.get("cpf_cnpj", ""))
+    email = c1.text_input(_rotulo("E-mail", "email", defaults, _k("email")), defaults.get("email", "não informado"), key=_k("email"))
+    celular = c2.text_input(_rotulo("Celular", "celular", defaults, _k("celular")), defaults.get("celular", ""), key=_k("celular"))
+    cpf_cnpj = c3.text_input(_rotulo("CPF/CNPJ", "cpf_cnpj", defaults, _k("cpf_cnpj")), defaults.get("cpf_cnpj", ""), key=_k("cpf_cnpj"))
 
     st.subheader("2. Dados da UC no ato da vistoria")
     c1, c2, c3, c4 = st.columns(4)
-    potencia_instalada_kw = c1.number_input(_rotulo("Potência Instalada (kW)", "potencia_instalada_kw", defaults),
+    potencia_instalada_kw = c1.number_input(_rotulo("Potência Instalada (kW)", "potencia_instalada_kw", defaults, _k("potencia_instalada_kw")),
                                              min_value=0.0, step=0.1,
-                                             value=_num(defaults, "potencia_instalada_kw", 0.0))
-    tensao_atendimento_v = c2.text_input(_rotulo("Tensão de Atendimento (V)", "tensao_atendimento_v", defaults),
+                                             value=_num(defaults, "potencia_instalada_kw", 0.0),
+                                             key=_k("potencia_instalada_kw"))
+    tensao_atendimento_v = c2.text_input(_rotulo("Tensão de Atendimento (V)", "tensao_atendimento_v", defaults, _k("tensao_atendimento_v")),
                                           _txt(defaults, "tensao_atendimento_v", "220"),
-                                          help='Use "220/380" para trifásico em baixa tensão')
+                                          help='Use "220/380" para trifásico em baixa tensão',
+                                          key=_k("tensao_atendimento_v"))
     opcoes_conexao = ["MONOFÁSICO", "BIFÁSICO", "TRIFÁSICO"]
-    tipo_conexao = c3.selectbox(_rotulo("Tipo de Conexão", "tipo_conexao", defaults), opcoes_conexao,
-                                 index=_idx(opcoes_conexao, defaults.get("tipo_conexao")))
+    tipo_conexao = c3.selectbox(_rotulo("Tipo de Conexão", "tipo_conexao", defaults, _k("tipo_conexao")), opcoes_conexao,
+                                 index=_idx(opcoes_conexao, defaults.get("tipo_conexao")), key=_k("tipo_conexao"))
     opcoes_ramal = ["AÉREO", "SUBTERRÂNEO"]
     tipo_ramal = c4.selectbox("Tipo de Ramal", opcoes_ramal,
                                index=_idx(opcoes_ramal, defaults.get("tipo_ramal")))
@@ -710,14 +734,14 @@ tensao_nominal_v: 220"""
 
     st.subheader("5. Coordenadas e previsão de ligação")
     c1, c2, c3 = st.columns(3)
-    fuso = c1.text_input(_rotulo("Fuso (ex: 22L)", "fuso", defaults), defaults.get("fuso", ""))
-    coord_x = c2.text_input(_rotulo("X", "coord_x", defaults), defaults.get("coord_x", ""))
-    coord_y = c3.text_input(_rotulo("Y", "coord_y", defaults), defaults.get("coord_y", ""))
+    fuso = c1.text_input(_rotulo("Fuso (ex: 22L)", "fuso", defaults, _k("fuso")), defaults.get("fuso", ""), key=_k("fuso"))
+    coord_x = c2.text_input(_rotulo("X", "coord_x", defaults, _k("coord_x")), defaults.get("coord_x", ""), key=_k("coord_x"))
+    coord_y = c3.text_input(_rotulo("Y", "coord_y", defaults, _k("coord_y")), defaults.get("coord_y", ""), key=_k("coord_y"))
 
     c1, c2, c3 = st.columns(3)
     data_prevista = c1.date_input("Previsão de ligação", value=date.today() + timedelta(days=15))
     opcoes_zona = ["URBANO", "RURAL"]
-    zona = c2.selectbox(_rotulo("Zona", "zona", defaults), opcoes_zona, index=_idx(opcoes_zona, defaults.get("zona")))
+    zona = c2.selectbox(_rotulo("Zona", "zona", defaults, _k("zona")), opcoes_zona, index=_idx(opcoes_zona, defaults.get("zona")), key=_k("zona"))
     gd_ja_instalado = c3.selectbox("Sistema GD já instalado?", ["SIM", "NÃO"])
 
     st.subheader("6. Painéis")
@@ -873,6 +897,13 @@ def form_equatorial():
     mostrar_downloads_equatorial()
 
     defaults = painel_busca_drive("equatorial")
+    _versao_equatorial = st.session_state.get("drive_versao_equatorial", 0)
+
+    def _k(campo: str) -> str:
+        """Ver `_k` equivalente em form_energisa — mesma ideia, key estável
+        entre reruns (não muda com o rótulo) e só reseta num novo
+        levantamento automático."""
+        return f"campo_{campo}_equatorial_v{_versao_equatorial}"
 
     exemplo_go = """nome: Nome Completo do Cliente
 cpf_cnpj: 000.000.000-00
@@ -1016,19 +1047,19 @@ dht_corrente_pct: 3"""
 
     st.subheader("1. Identificação")
     c1, c2, c3 = st.columns(3)
-    nome = c1.text_input(_rotulo("Nome completo", "nome", defaults), defaults.get("nome", ""))
-    cpf_cnpj = c2.text_input(_rotulo("CPF/CNPJ", "cpf_cnpj", defaults), defaults.get("cpf_cnpj", ""))
-    celular = c3.text_input("Celular", defaults.get("celular", ""))
+    nome = c1.text_input(_rotulo("Nome completo", "nome", defaults, _k("nome")), defaults.get("nome", ""), key=_k("nome"))
+    cpf_cnpj = c2.text_input(_rotulo("CPF/CNPJ", "cpf_cnpj", defaults, _k("cpf_cnpj")), defaults.get("cpf_cnpj", ""), key=_k("cpf_cnpj"))
+    celular = c3.text_input(_rotulo("Celular", "celular", defaults, _k("celular")), defaults.get("celular", ""), key=_k("celular"))
 
     c1, c2 = st.columns(2)
-    endereco = c1.text_input(_rotulo("Endereço (rua, número, complemento)", "endereco", defaults), defaults.get("endereco", ""))
-    email = c2.text_input("E-mail", defaults.get("email", ""))
+    endereco = c1.text_input(_rotulo("Endereço (rua, número, complemento)", "endereco", defaults, _k("endereco")), defaults.get("endereco", ""), key=_k("endereco"))
+    email = c2.text_input(_rotulo("E-mail", "email", defaults, _k("email")), defaults.get("email", ""), key=_k("email"))
 
     c1, c2, c3, c4 = st.columns(4)
-    cep = c1.text_input(_rotulo("CEP", "cep", defaults), _txt(defaults, "cep", "76240000"))
-    municipio = c2.text_input(_rotulo("Município", "municipio", defaults), _txt(defaults, "municipio", "Aragarças"))
-    uf = c3.text_input(_rotulo("UF", "uf", defaults), _txt(defaults, "uf", "GO"))
-    bairro = c4.text_input(_rotulo("Bairro", "bairro", defaults), defaults.get("bairro", ""))
+    cep = c1.text_input(_rotulo("CEP", "cep", defaults, _k("cep")), _txt(defaults, "cep", "76240000"), key=_k("cep"))
+    municipio = c2.text_input(_rotulo("Município", "municipio", defaults, _k("municipio")), _txt(defaults, "municipio", "Aragarças"), key=_k("municipio"))
+    uf = c3.text_input(_rotulo("UF", "uf", defaults, _k("uf")), _txt(defaults, "uf", "GO"), key=_k("uf"))
+    bairro = c4.text_input(_rotulo("Bairro", "bairro", defaults, _k("bairro")), defaults.get("bairro", ""), key=_k("bairro"))
 
     uc_existente = st.text_input("UC (se já existir)", defaults.get("uc_existente", ""))
 
@@ -1054,9 +1085,9 @@ dht_corrente_pct: 3"""
 
     st.subheader("3. Coordenadas e modalidade")
     c1, c2, c3 = st.columns(3)
-    fuso = c1.text_input(_rotulo("Fuso (ex: 22L)", "fuso", defaults), defaults.get("fuso", ""))
-    coord_x = c2.text_input(_rotulo("X", "coord_x", defaults), defaults.get("coord_x", ""))
-    coord_y = c3.text_input(_rotulo("Y", "coord_y", defaults), defaults.get("coord_y", ""))
+    fuso = c1.text_input(_rotulo("Fuso (ex: 22L)", "fuso", defaults, _k("fuso")), defaults.get("fuso", ""), key=_k("fuso"))
+    coord_x = c2.text_input(_rotulo("X", "coord_x", defaults, _k("coord_x")), defaults.get("coord_x", ""), key=_k("coord_x"))
+    coord_y = c3.text_input(_rotulo("Y", "coord_y", defaults, _k("coord_y")), defaults.get("coord_y", ""), key=_k("coord_y"))
 
     c1, c2 = st.columns(2)
     opcoes_modalidade_go = ["AUTOCONSUMO LOCAL", "AUTOCONSUMO REMOTO"]
