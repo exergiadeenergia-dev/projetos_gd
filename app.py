@@ -87,7 +87,11 @@ def _num(defaults: dict, campo: str, padrao):
     """Lê um valor numérico de `defaults` (que pode vir como string, já
     que o quadro de conferência do Drive edita tudo como texto) devolvendo
     `padrao` (int ou float, conforme o tipo de `padrao`) se não der pra
-    converter."""
+    converter. Ao contrário do `_txt` acima, aqui `padrao` continua valendo
+    mesmo com `defaults` não-vazio — a maioria desses campos (disjuntor, DPS,
+    fator de potência, nº de hastes) são valores padrão de engenharia
+    reaproveitados projeto a projeto, não dados específicos do cliente, e já
+    eram assim antes da busca no Drive existir. Sempre revise antes de gerar."""
     valor = defaults.get(campo)
     if valor is None or str(valor).strip() == "":
         return padrao
@@ -96,6 +100,20 @@ def _num(defaults: dict, campo: str, padrao):
         return int(convertido) if isinstance(padrao, int) else convertido
     except ValueError:
         return padrao
+
+
+def _txt(defaults: dict, campo: str, padrao: str = "") -> str:
+    """Valor de texto pra pré-preencher um campo do formulário manual.
+    Se o campo veio do levantamento do Drive/texto colado, usa esse valor.
+    Se `defaults` está vazio (formulário em branco, ninguém usou Drive/colar
+    ainda), usa o valor de exemplo `padrao` — igual sempre foi.
+    Mas se `defaults` NÃO está vazio (ou seja, veio do Drive) e esse campo
+    específico não foi encontrado, o campo fica em branco em vez de mostrar
+    o valor de exemplo — pra não passar a impressão de que aquele dado foi
+    conferido quando na verdade ninguém olhou pra ele."""
+    if campo in defaults:
+        return str(defaults[campo])
+    return padrao if not defaults else ""
 
 
 def caixa_fonte_inmetro():
@@ -576,7 +594,7 @@ tensao_nominal_v: 220"""
 
     c1, c2, c3 = st.columns(3)
     cidade = c1.text_input("Cidade", defaults.get("cidade", ""))
-    uf = c2.text_input("UF", defaults.get("uf", "MT"))
+    uf = c2.text_input("UF", _txt(defaults, "uf", "MT"))
     cep = c3.text_input("CEP", defaults.get("cep", ""))
 
     c1, c2, c3 = st.columns(3)
@@ -589,7 +607,7 @@ tensao_nominal_v: 220"""
     potencia_instalada_kw = c1.number_input("Potência Instalada (kW)", min_value=0.0, step=0.1,
                                              value=_num(defaults, "potencia_instalada_kw", 0.0))
     tensao_atendimento_v = c2.text_input("Tensão de Atendimento (V)",
-                                          defaults.get("tensao_atendimento_v", "220"),
+                                          _txt(defaults, "tensao_atendimento_v", "220"),
                                           help='Use "220/380" para trifásico em baixa tensão')
     opcoes_conexao = ["MONOFÁSICO", "BIFÁSICO", "TRIFÁSICO"]
     tipo_conexao = c3.selectbox("Tipo de Conexão", opcoes_conexao,
@@ -946,9 +964,9 @@ dht_corrente_pct: 3"""
     email = c2.text_input("E-mail", defaults.get("email", ""))
 
     c1, c2, c3, c4 = st.columns(4)
-    cep = c1.text_input("CEP", defaults.get("cep", "76240000"))
-    municipio = c2.text_input("Município", defaults.get("municipio", "Aragarças"))
-    uf = c3.text_input("UF", defaults.get("uf", "GO"))
+    cep = c1.text_input("CEP", _txt(defaults, "cep", "76240000"))
+    municipio = c2.text_input("Município", _txt(defaults, "municipio", "Aragarças"))
+    uf = c3.text_input("UF", _txt(defaults, "uf", "GO"))
     bairro = c4.text_input("Bairro", defaults.get("bairro", ""))
 
     uc_existente = st.text_input("UC (se já existir)", defaults.get("uc_existente", ""))
