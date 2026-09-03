@@ -129,28 +129,42 @@ def caixa_fonte_inmetro():
     )
 
 
-def _pendente(key: str, defaults: dict, campo: str) -> bool:
+def _pendente(key: str, defaults: dict, campo: str, valor_padrao: str = "") -> bool:
     """True quando esta leitura veio do Drive/colar-texto (defaults não
     está vazio) e o campo continua vazio — mas olhando o valor ATUAL do
     próprio campo na tela (via `key`, que é estável entre reruns), não só
     o valor que veio do Drive. É por isso que a mensagem some assim que
     você digita ou corrige o campo, sem precisar de um novo levantamento:
     o widget já existe em `st.session_state[key]` com o que você acabou de
-    digitar antes desse rerun começar."""
+    digitar antes desse rerun começar.
+
+    `valor_padrao` precisa ser o MESMO valor que o widget vai usar quando
+    o campo não vier do Drive (ex.: "MT" pra UF, "220" pra Tensão de
+    Atendimento — valores padrão de engenharia que nunca ficam realmente
+    em branco). Sem passar isso, um campo desses era marcado "não
+    encontrado" por engano bem no instante em que um novo levantamento
+    cria a chave do campo pela primeira vez — antes do próprio widget
+    existir em `session_state`, quando `_pendente` só tinha como cair de
+    volta num "" que não é o valor real que vai aparecer na tela.
+    "0"/"0.0" também conta como vazio aqui — é o valor inicial de um
+    number_input sem dado nenhum (ex.: Potência Instalada), nunca um
+    resultado de engenharia válido por si só."""
     if not defaults:
         return False
-    valor_atual = st.session_state.get(key, defaults.get(campo, ""))
-    return not str(valor_atual).strip()
+    valor_atual = str(st.session_state.get(key, valor_padrao)).strip()
+    return valor_atual in ("", "0", "0.0")
 
 
-def _rotulo(texto: str, campo: str, defaults: dict, key: str) -> str:
+def _rotulo(texto: str, campo: str, defaults: dict, key: str, valor_padrao: str = "") -> str:
     """Rótulo de um campo do formulário manual — fica vermelho com um
     aviso enquanto esse dado deveria ter vindo do levantamento automático
     mas continua vazio, e volta ao normal assim que você preenche ou
     corrige (mesmo sem fazer um novo levantamento). Só se aplica a dados
     que a leitura automática realmente tenta reconhecer; os demais
-    (padrões de engenharia, campos opcionais) mantêm o rótulo normal."""
-    if _pendente(key, defaults, campo):
+    (padrões de engenharia, campos opcionais) mantêm o rótulo normal.
+    Veja `_pendente` sobre por que `valor_padrao` importa pros campos que
+    têm um valor de engenharia padrão (UF, Tensão de Atendimento etc.)."""
+    if _pendente(key, defaults, campo, valor_padrao):
         return f":red[{texto} ⚠️ não encontrado]"
     return texto
 
@@ -460,6 +474,12 @@ def painel_busca_drive(tipo: str) -> dict:
                         if tipo == "equatorial":
                             campos = _remapear_para_equatorial(campos)
                         st.session_state[chave_confirmado] = campos
+                        # quantidade/potência de módulo e inversor achadas num
+                        # pedido de kit solar (marca/modelo sempre em branco,
+                        # pra confirmar manualmente) — guardadas à parte dos
+                        # `campos` escalares porque são listas de linhas.
+                        st.session_state[f"drive_paineis_{tipo}"] = resultado.paineis
+                        st.session_state[f"drive_inversores_{tipo}"] = resultado.inversores
                         # nova "versão" de leitura: os campos do formulário
                         # abaixo usam isso na key pra nascer de novo com os
                         # valores atuais (mesmo que o usuário já tivesse
@@ -492,6 +512,28 @@ def painel_busca_drive(tipo: str) -> dict:
                 st.success(
                     "Campos já aplicados no formulário abaixo — role até lá pra conferir e "
                     "corrigir cada um antes de clicar em Gerar documentos:\n\n" + linhas_fonte
+                )
+            if resultado.paineis or resultado.inversores:
+                # marca/modelo pode vir preenchido (Projeto Executivo/Diagrama
+                # Unifilar, por decisão explícita do usuário) ou em branco de
+                # propósito (pedido de kit de revenda) — a mensagem reflete o
+                # que realmente aconteceu em vez de sempre afirmar "em branco".
+                tem_marca_modelo = any(
+                    (item.get("fabricante") or item.get("modelo"))
+                    for item in resultado.paineis + resultado.inversores
+                )
+                aviso_marca_modelo = (
+                    "Marca e modelo vieram do Projeto Executivo/Diagrama Unifilar — confira mesmo "
+                    "assim pelas tabelas do INMETRO antes de gerar."
+                    if tem_marca_modelo else
+                    "Marca e modelo continuam em branco de propósito (vieram de um pedido de kit): "
+                    "confirme pelas tabelas do INMETRO antes de gerar."
+                )
+                st.info(
+                    f"📦 Achei {len(resultado.paineis)} modelo(s) de painel e "
+                    f"{len(resultado.inversores)} modelo(s) de inversor — "
+                    "quantidade e potência já foram pras tabelas de Painéis/Inversores (ou "
+                    "Módulos/Inversores) abaixo. " + aviso_marca_modelo
                 )
 
         return st.session_state.get(chave_confirmado, {})
@@ -674,21 +716,22 @@ tensao_nominal_v: 220"""
 
     c1, c2, c3 = st.columns(3)
     cidade = c1.text_input(_rotulo("Cidade", "cidade", defaults, _k("cidade")), defaults.get("cidade", ""), key=_k("cidade"))
-    uf = c2.text_input(_rotulo("UF", "uf", defaults, _k("uf")), _txt(defaults, "uf", "MT"), key=_k("uf"))
+    uf = c2.text_input(_rotulo("UF", "uf", defaults, _k("uf"), "MT"), _txt(defaults, "uf", "MT"), key=_k("uf"))
     cep = c3.text_input(_rotulo("CEP", "cep", defaults, _k("cep")), defaults.get("cep", ""), key=_k("cep"))
 
     c1, c2, c3 = st.columns(3)
-    email = c1.text_input(_rotulo("E-mail", "email", defaults, _k("email")), defaults.get("email", "não informado"), key=_k("email"))
+    email = c1.text_input(_rotulo("E-mail", "email", defaults, _k("email"), "não informado"), defaults.get("email", "não informado"), key=_k("email"))
     celular = c2.text_input(_rotulo("Celular", "celular", defaults, _k("celular")), defaults.get("celular", ""), key=_k("celular"))
     cpf_cnpj = c3.text_input(_rotulo("CPF/CNPJ", "cpf_cnpj", defaults, _k("cpf_cnpj")), defaults.get("cpf_cnpj", ""), key=_k("cpf_cnpj"))
 
     st.subheader("2. Dados da UC no ato da vistoria")
     c1, c2, c3, c4 = st.columns(4)
-    potencia_instalada_kw = c1.number_input(_rotulo("Potência Instalada (kW)", "potencia_instalada_kw", defaults, _k("potencia_instalada_kw")),
-                                             min_value=0.0, step=0.1,
-                                             value=_num(defaults, "potencia_instalada_kw", 0.0),
-                                             key=_k("potencia_instalada_kw"))
-    tensao_atendimento_v = c2.text_input(_rotulo("Tensão de Atendimento (V)", "tensao_atendimento_v", defaults, _k("tensao_atendimento_v")),
+    # "Potência Instalada (kW)" nasce do somatório da Relação de Carga
+    # (item 3, logo abaixo) — por isso o widget de verdade só é montado
+    # DEPOIS de calcular essa soma; `st.empty()` guarda o lugar aqui em
+    # cima pra ele continuar aparecendo nesta posição na tela.
+    campo_potencia_instalada = c1.empty()
+    tensao_atendimento_v = c2.text_input(_rotulo("Tensão de Atendimento (V)", "tensao_atendimento_v", defaults, _k("tensao_atendimento_v"), "220"),
                                           _txt(defaults, "tensao_atendimento_v", "220"),
                                           help='Use "220/380" para trifásico em baixa tensão',
                                           key=_k("tensao_atendimento_v"))
@@ -710,6 +753,30 @@ tensao_nominal_v: 220"""
             {"quantidade": 1, "equipamento": "Eletrônicos", "pot_unitaria_w": 800, "fator_demanda": 0.8},
         ],
         "cargas_energisa",
+    )
+    # Soma (quantidade × potência unitária × fator de demanda) de cada
+    # linha da Relação de Carga acima — é esse número que vira o valor
+    # inicial de "Potência Instalada (kW)" lá em cima, porque é dali que
+    # esse dado já vem no formulário de vocês. Continua editável: se o
+    # levantamento do Drive achar um valor, ou se você digitar outro, o seu
+    # vale — isso aqui é só o ponto de partida.
+    soma_cargas_kw = 0.0
+    for linha in cargas:
+        try:
+            qtd = float(linha.get("quantidade") or 0)
+            pot_w = float(linha.get("pot_unitaria_w") or 0)
+            fd = float(linha.get("fator_demanda") or 0)
+            soma_cargas_kw += qtd * pot_w * fd / 1000
+        except (TypeError, ValueError):
+            continue
+    soma_cargas_kw = round(soma_cargas_kw, 2)
+    st.caption(f"🔢 Somatório da Relação de Carga acima: **{soma_cargas_kw:.2f} kW** "
+               "(quantidade × potência unitária × fator de demanda).")
+    potencia_instalada_kw = campo_potencia_instalada.number_input(
+        _rotulo("Potência Instalada (kW)", "potencia_instalada_kw", defaults, _k("potencia_instalada_kw"), str(soma_cargas_kw)),
+        min_value=0.0, step=0.1,
+        value=_num(defaults, "potencia_instalada_kw", soma_cargas_kw),
+        key=_k("potencia_instalada_kw"),
     )
 
     st.subheader("4. Proteções e padrão")
@@ -746,19 +813,35 @@ tensao_nominal_v: 220"""
 
     st.subheader("6. Painéis")
     caixa_fonte_inmetro()
+    _paineis_drive = st.session_state.get("drive_paineis_energisa") or []
+    if _paineis_drive:
+        if any(p.get("fabricante") or p.get("modelo") for p in _paineis_drive):
+            st.caption("Quantidade, potência, marca e modelo abaixo vieram do Projeto Executivo/Diagrama "
+                       "Unifilar lido no Drive — confira mesmo assim pelas tabelas do INMETRO.")
+        else:
+            st.caption("Quantidade e potência abaixo vieram de um pedido de kit lido no Drive — "
+                       "marca e modelo ficaram em branco de propósito, confirme pelas tabelas do INMETRO.")
     paineis = tabela_equipamentos(
         "Um item por modelo de painel diferente",
         None,
-        [{"quantidade": 0, "fabricante": "", "modelo": "", "area_m2": 0, "potencia_kw": 0.0}],
-        "paineis_energisa",
+        _paineis_drive or [{"quantidade": 0, "fabricante": "", "modelo": "", "area_m2": 0, "potencia_kw": 0.0}],
+        _k("tabela_paineis"),
     )
 
     st.subheader("7. Inversores")
+    _inversores_drive = st.session_state.get("drive_inversores_energisa") or []
+    if _inversores_drive:
+        if any(i.get("fabricante") or i.get("modelo") for i in _inversores_drive):
+            st.caption("Quantidade, potência, marca e modelo abaixo vieram do Projeto Executivo/Diagrama "
+                       "Unifilar lido no Drive — confira mesmo assim pelas tabelas do INMETRO.")
+        else:
+            st.caption("Quantidade e potência abaixo vieram de um pedido de kit lido no Drive — "
+                       "marca e modelo ficaram em branco de propósito, confirme pelas tabelas do INMETRO.")
     inversores = tabela_equipamentos(
         "Um item por modelo de inversor diferente",
         None,
-        [{"quantidade": 0, "fabricante": "", "modelo": "", "potencia_kw": 0.0, "tensao_nominal_v": 220}],
-        "inversores_energisa",
+        _inversores_drive or [{"quantidade": 0, "fabricante": "", "modelo": "", "potencia_kw": 0.0, "tensao_nominal_v": 220}],
+        _k("tabela_inversores"),
     )
 
     gerar = st.button("Gerar documentos (Energisa-MT)", type="primary")
@@ -1058,7 +1141,7 @@ dht_corrente_pct: 3"""
     c1, c2, c3, c4 = st.columns(4)
     cep = c1.text_input(_rotulo("CEP", "cep", defaults, _k("cep")), _txt(defaults, "cep", "76240000"), key=_k("cep"))
     municipio = c2.text_input(_rotulo("Município", "municipio", defaults, _k("municipio")), _txt(defaults, "municipio", "Aragarças"), key=_k("municipio"))
-    uf = c3.text_input(_rotulo("UF", "uf", defaults, _k("uf")), _txt(defaults, "uf", "GO"), key=_k("uf"))
+    uf = c3.text_input(_rotulo("UF", "uf", defaults, _k("uf"), "GO"), _txt(defaults, "uf", "GO"), key=_k("uf"))
     bairro = c4.text_input(_rotulo("Bairro", "bairro", defaults, _k("bairro")), defaults.get("bairro", ""), key=_k("bairro"))
 
     uc_existente = st.text_input("UC (se já existir)", defaults.get("uc_existente", ""))
@@ -1097,19 +1180,63 @@ dht_corrente_pct: 3"""
 
     st.subheader("4. Módulos")
     caixa_fonte_inmetro()
+    # Marca/modelo só vêm preenchidos quando a fonte foi um Projeto
+    # Executivo/Diagrama Unifilar (decisão explícita do usuário); de um
+    # pedido de kit `drive_cliente` já devolve fabricante/modelo em branco
+    # — por isso é seguro simplesmente repassar o que veio, sem forçar em
+    # branco aqui (isso era um bug: jogava fora marca/modelo mesmo quando
+    # a extração tinha achado certinho).
+    _paineis_drive_go = [
+        {
+            "potencia_w": round(p["potencia_kw"] * 1000),
+            "quantidade": p["quantidade"],
+            "fabricante": p.get("fabricante", ""),
+            "modelo": p.get("modelo", ""),
+        }
+        for p in (st.session_state.get("drive_paineis_equatorial") or [])
+    ]
+    if _paineis_drive_go:
+        if any(p["fabricante"] or p["modelo"] for p in _paineis_drive_go):
+            st.caption("Quantidade, potência, marca e modelo abaixo vieram do Projeto Executivo/Diagrama "
+                       "Unifilar lido no Drive — confira mesmo assim pelas tabelas do INMETRO.")
+        else:
+            st.caption("Quantidade e potência abaixo vieram de um pedido de kit lido no Drive — "
+                       "marca e modelo ficaram em branco de propósito, confirme pelas tabelas do INMETRO.")
     modulos = tabela_equipamentos(
         "Um item por modelo de módulo diferente",
         None,
-        [{"potencia_w": 0, "quantidade": 0, "fabricante": "", "modelo": ""}],
-        "modulos_equatorial",
+        _paineis_drive_go or [{"potencia_w": 0, "quantidade": 0, "fabricante": "", "modelo": ""}],
+        _k("tabela_modulos"),
     )
 
     st.subheader("5. Inversor(es)")
     st.caption("Busque o datasheet real do fabricante para corrente/rendimento — não estime.")
+    # A tabela de inversor daqui não tem coluna "quantidade" (é uma linha
+    # por inversor) — diferente da tabela de Painéis/Inversores do
+    # Energisa-MT acima. Por isso, se a leitura achou quantidade > 1, a
+    # linha é repetida (mesmo fabricante/modelo/potência) em vez de vir
+    # com um número que a tabela não tem onde mostrar.
+    _inversores_drive_go = []
+    for i in (st.session_state.get("drive_inversores_equatorial") or []):
+        linha = {
+            "fabricante": i.get("fabricante", ""),
+            "modelo": i.get("modelo", ""),
+            "potencia_nominal_kw": i.get("potencia_kw", 0.0),
+            "faixa_tensao_v": i.get("tensao_nominal_v") or 220,
+            # corrente/rendimento/DHT não vêm do desenho — sempre do
+            # datasheet do fabricante, nunca estimados aqui.
+            "corrente_nominal_a": 0.0, "fator_potencia": 1.0,
+            "rendimento_pct": 98.0, "dht_corrente_pct": 3.0,
+        }
+        _inversores_drive_go.extend([linha] * max(1, int(i.get("quantidade") or 1)))
+    if _inversores_drive_go:
+        st.caption("Fabricante, modelo, potência e tensão abaixo vieram do Projeto Executivo/Diagrama "
+                   "Unifilar lido no Drive — corrente/fator de potência/rendimento continuam com valor "
+                   "de exemplo, busque o datasheet real antes de gerar.")
     inversores = tabela_equipamentos(
         "Um item por modelo de inversor diferente",
         None,
-        [{"fabricante": "", "modelo": "", "potencia_nominal_kw": 0.0, "faixa_tensao_v": 220,
+        _inversores_drive_go or [{"fabricante": "", "modelo": "", "potencia_nominal_kw": 0.0, "faixa_tensao_v": 220,
           "corrente_nominal_a": 0.0, "fator_potencia": 1.0, "rendimento_pct": 98.0, "dht_corrente_pct": 3.0}],
         "inversores_equatorial",
     )
