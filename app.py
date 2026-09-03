@@ -151,6 +151,27 @@ st.set_page_config(
 )
 if LOGO_PATH.exists():
     st.logo(str(LOGO_PATH), size="large")
+    # a arte da logo tem fundo branco sólido (não é transparente) — no tema
+    # escuro isso ficaria um retângulo branco cru colado no fundo preto,
+    # então envolve a logo (cabeçalho e barra lateral) num cartão branco
+    # arredondado em vez de mudar a arte original da marca.
+    st.markdown(
+        """
+        <style>
+        [data-testid="stImage"] img {
+            background: #FFFFFF;
+            padding: 8px 16px;
+            border-radius: 12px;
+        }
+        [data-testid="stLogo"] {
+            background: #FFFFFF;
+            padding: 6px 14px;
+            border-radius: 10px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 MODELO_ENERGISA = BASE / "memorialgd_1.xlsm"
 MODELO_ANEXO1 = BASE / "NT_00020_EQTL-06-Anexo-I-Formulario-de-Solicitacao.xlsx"
