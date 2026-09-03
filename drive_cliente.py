@@ -99,7 +99,9 @@ def decimal_para_utm(lat: float, lon: float):
     return zona, banda, round(x), round(y)
 
 
-COORD_DMS_RE = re.compile(r"(\d{1,3})\s*[ºo°]\s*(\d{1,2})\s*'\s*([\d.,]+)\s*''?\s*([NSEOW])")
+COORD_DMS_RE = re.compile(
+    r"(\d{1,3})\s*[ºo°]\s*(\d{1,2})\s*['′]\s*([\d.,]+)\s*(?:''|\"|″)?\s*([NSEOW])"
+)
 
 
 def _normalizar(texto: str) -> str:
@@ -230,9 +232,91 @@ def extrair_endereco_livre(texto: str) -> dict:
     return dados
 
 
+def extrair_endereco_bloco_cep(texto: str) -> dict:
+    """Outro layout de 'espelho de conta' — diferente do `extrair_endereco_livre`
+    acima. Aqui o logradouro e o número vêm juntos numa linha, às vezes
+    seguidos de um código interno da concessionária (matrícula, código de
+    leitura etc.) que a gente NÃO tenta identificar — como não dá pra saber
+    com certeza o que aquele número representa sem confirmação, ele fica de
+    fora de qualquer campo, seguindo a regra de nunca adivinhar. O bairro
+    fecha essa linha depois de um traço. Numa linha seguinte vem "CEP" com
+    rótulo explícito, o número do CEP e a cidade depois de outro traço.
+    Exemplo real (anonimizado, conferido nesta conversa):
+        RUA CARAJAS 286 1111805172000 - CENTRO
+        CEP 78600000 - BARRA DO GARCAS
+    """
+    dados = {}
+    tu = texto.upper()
+    m = re.search(
+        r"\b([A-ZÀ-Ú][A-ZÀ-Ú\s\.]*?)\s+(\d+)(?:\s+\d{4,})?\s*-\s*"
+        r"([A-ZÀ-Ú][A-ZÀ-Ú0-9º°.\s]*?)\s*(?:\n|$)",
+        tu,
+    )
+    if m:
+        dados["logradouro"] = m.group(1).strip().title()
+        dados["numero"] = m.group(2).strip()
+        dados["bairro"] = m.group(3).strip().title()
+    m = re.search(
+        r"\bCEP\s*[:\-]?\s*(\d{5}-?\d{3}|\d{8})\s*-\s*([A-ZÀ-Ú][A-ZÀ-Ú\s]*?)\s*(?:\n|$)",
+        tu,
+    )
+    if m:
+        dados["cep"] = re.sub(r"\D", "", m.group(1))
+        dados["cidade"] = m.group(2).strip().title()
+    return dados
+
+
+def extrair_contato_livre(texto: str) -> dict:
+    """Celular e e-mail soltos no texto, sem rótulo — como aparecem em
+    alguns modelos de conta/espelho: um número de 11 dígitos (DDD + celular,
+    9 na frente) sozinho numa linha, com o e-mail perto (mesma linha ou a
+    seguinte). Só reconhece o número como celular quando um e-mail aparece
+    por perto, exatamente pra não confundir com um CPF solto de 11 dígitos
+    (que não tem essa relação com e-mail por perto) — CPF continua sendo
+    reconhecido só com o rótulo explícito em `extrair_dados_genericos`."""
+    dados = {}
+    linhas = [l.strip() for l in texto.split("\n")]
+    email_re = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
+    for i, linha in enumerate(linhas):
+        if not linha:
+            continue
+        vizinhas = " ".join(linhas[max(0, i - 1): i + 2])
+        m_email = email_re.search(linha)
+        if m_email and "email" not in dados:
+            dados["email"] = m_email.group(0)
+        so_digitos = re.sub(r"\D", "", linha)
+        if (
+            "celular" not in dados
+            and len(so_digitos) == 11
+            and so_digitos[2] == "9"
+            and so_digitos == re.sub(r"[\s()\-.]", "", linha)  # linha é só o telefone
+            and email_re.search(vizinhas)
+        ):
+            dados["celular"] = so_digitos
+    return dados
+
+
+def extrair_coordenadas_livres(texto: str) -> dict:
+    """Coordenadas soltas no texto (fora do formato de ART) — mesma
+    extração/validação DMS -> UTM já usada pra ART, mas roda sobre qualquer
+    documento (espelho de conta, fatura etc.)."""
+    dados = {}
+    coord, _achados = extrair_coordenadas(_normalizar(texto))
+    if coord:
+        dados["fuso"], dados["coord_x"], dados["coord_y"] = coord
+    return dados
+
+
 CAMPOS_TIPO = {
-    "energisa": (extrair_dados_art, extrair_dados_conta_energisa, extrair_endereco_livre, extrair_dados_genericos),
-    "equatorial": (extrair_dados_art, extrair_endereco_livre, extrair_dados_genericos),
+    "energisa": (
+        extrair_dados_art, extrair_dados_conta_energisa, extrair_endereco_livre,
+        extrair_endereco_bloco_cep, extrair_contato_livre, extrair_coordenadas_livres,
+        extrair_dados_genericos,
+    ),
+    "equatorial": (
+        extrair_dados_art, extrair_endereco_livre, extrair_endereco_bloco_cep,
+        extrair_contato_livre, extrair_coordenadas_livres, extrair_dados_genericos,
+    ),
 }
 
 
@@ -271,6 +355,15 @@ MIME_TEXTO_EXTRAIVEL = {
 # atenção redobrada na conferência.
 MIME_IMAGEM = {"image/jpeg", "image/png"}
 MAX_BYTES_IMAGEM_OCR = 15 * 1024 * 1024  # não roda OCR em foto gigante
+
+# Muitos "espelhos de conta"/comprovantes chegam pro cliente como uma FOTO
+# (tirada com o celular, às vezes exportada como PDF por um app de scanner)
+# em vez de um PDF gerado digitalmente. Nesses casos o pypdf não acha texto
+# nenhum (ou quase nada) — a página é só uma imagem dentro do PDF. Quando
+# isso acontece, a gente trata a página como foto e roda OCR nela também,
+# em vez de simplesmente desistir do arquivo.
+LIMIAR_TEXTO_PDF_OK = 40  # caracteres não-espaço; abaixo disso, tenta OCR
+MAX_PAGINAS_OCR_PDF = 6  # nunca faz OCR em PDF gigante (custo/tempo)
 
 MAX_ARQUIVOS = 25
 MAX_PROFUNDIDADE = 3
@@ -367,6 +460,21 @@ def _ocr_imagem(conteudo: bytes) -> str:
         return pytesseract.image_to_string(img, lang="eng")
 
 
+def _ocr_pdf_escaneado(conteudo: bytes) -> str:
+    """Renderiza cada página do PDF como imagem (PyMuPDF, sem depender de
+    binário externo tipo poppler) e roda OCR em cada uma — usado só quando
+    o PDF não tem camada de texto (foto/scan salvo como PDF)."""
+    import fitz  # PyMuPDF
+    doc = fitz.open(stream=conteudo, filetype="pdf")
+    partes = []
+    for i, pagina in enumerate(doc):
+        if i >= MAX_PAGINAS_OCR_PDF:
+            break
+        pix = pagina.get_pixmap(dpi=250)
+        partes.append(_ocr_imagem(pix.tobytes("png")))
+    return "\n".join(partes)
+
+
 def baixar_texto_arquivo(servico, arquivo: dict) -> tuple[str, bool]:
     """Baixa/exporta um arquivo e devolve (texto, veio_de_ocr). Devolve
     string vazia para tipos que não sabemos extrair texto."""
@@ -394,7 +502,19 @@ def baixar_texto_arquivo(servico, arquivo: dict) -> tuple[str, bool]:
             partes = []
             for pagina in reader.pages:
                 partes.append(pagina.extract_text() or "")
-            return "\n".join(partes), False
+            texto = "\n".join(partes)
+            if len(re.sub(r"\s", "", texto)) >= LIMIAR_TEXTO_PDF_OK:
+                return texto, False
+            # quase nenhum texto veio do PDF — provavelmente é uma foto/scan
+            # salvo como PDF, não um PDF "de verdade". Tenta OCR nas páginas
+            # antes de desistir do arquivo.
+            try:
+                texto_ocr = _ocr_pdf_escaneado(conteudo)
+            except Exception:
+                return texto, False
+            if len(texto_ocr.strip()) > len(texto.strip()):
+                return texto_ocr, True
+            return texto, False
 
         if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             from docx import Document
