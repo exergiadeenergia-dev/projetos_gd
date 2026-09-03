@@ -1199,12 +1199,19 @@ class ResultadoLevantamento:
     arquivos_lidos: list = field(default_factory=list)
     arquivos_ignorados: list = field(default_factory=list)
     erros: list = field(default_factory=list)
-    # linhas de equipamento (quantidade/potência; marca/modelo sempre em
-    # branco) achadas em pedidos de kit solar — uma lista por tipo, porque
-    # (ao contrário dos `campos` escalares) pode fazer sentido juntar linhas
-    # de mais de um arquivo/pedido.
+    # Linhas de equipamento (pedido de kit OU Projeto Executivo/Diagrama
+    # Unifilar). MESMA regra do `campos` escalar: o primeiro arquivo em que
+    # a lista de painéis (ou de inversores) aparece "ganha" — nunca soma
+    # com o que um arquivo seguinte também encontrar. Antes disso, dois
+    # arquivos da mesma pasta mencionando o mesmo painel físico (ex.: o
+    # pedido do kit E o Projeto Executivo) faziam ele aparecer duas vezes
+    # na tabela — `_sem_duplicatas` só pega repetição dentro do MESMO
+    # arquivo (ex.: o mesmo trecho lido via texto vetorial e via OCR), não
+    # o mesmo equipamento relatado por dois arquivos diferentes.
     paineis: list = field(default_factory=list)
     inversores: list = field(default_factory=list)
+    fonte_paineis: str = ""
+    fonte_inversores: str = ""
 
 
 def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
@@ -1248,18 +1255,36 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
         # resultado depois que `levantamento_pasta` retorna com sucesso.
         # Isolado por arquivo, do mesmo jeito, pra um problema aqui nunca
         # apagar os campos que já tinham sido reconhecidos certinho.
-        try:
-            equipamentos = extrair_equipamentos_pedido(texto)
-            resultado.paineis.extend(equipamentos["paineis"])
-            resultado.inversores.extend(equipamentos["inversores"])
-        except Exception as exc:
-            resultado.erros.append(f"[erro ao reconhecer equipamentos de pedido em {nome}: {exc}]")
+        #
+        # E, assim como os campos escalares, o PRIMEIRO arquivo que achar a
+        # lista de painéis (ou de inversores) ganha — não soma com o que um
+        # arquivo seguinte também encontrar (isso duplicava o mesmo
+        # equipamento físico quando, por exemplo, o pedido do kit e o
+        # Projeto Executivo do mesmo cliente mencionavam o mesmo painel).
+        # Por isso pula a chamada inteira assim que os dois já estiverem
+        # preenchidos — nem gasta tempo tentando reconhecer de novo.
+        if not resultado.paineis or not resultado.inversores:
+            try:
+                equipamentos = extrair_equipamentos_pedido(texto)
+                if not resultado.paineis and equipamentos["paineis"]:
+                    resultado.paineis = equipamentos["paineis"]
+                    resultado.fonte_paineis = nome
+                if not resultado.inversores and equipamentos["inversores"]:
+                    resultado.inversores = equipamentos["inversores"]
+                    resultado.fonte_inversores = nome
+            except Exception as exc:
+                resultado.erros.append(f"[erro ao reconhecer equipamentos de pedido em {nome}: {exc}]")
 
-        try:
-            equipamentos_pe = extrair_equipamentos_projeto_executivo(texto)
-            resultado.paineis.extend(equipamentos_pe["paineis"])
-            resultado.inversores.extend(equipamentos_pe["inversores"])
-        except Exception as exc:
-            resultado.erros.append(f"[erro ao reconhecer equipamentos de projeto executivo em {nome}: {exc}]")
+        if not resultado.paineis or not resultado.inversores:
+            try:
+                equipamentos_pe = extrair_equipamentos_projeto_executivo(texto)
+                if not resultado.paineis and equipamentos_pe["paineis"]:
+                    resultado.paineis = equipamentos_pe["paineis"]
+                    resultado.fonte_paineis = nome
+                if not resultado.inversores and equipamentos_pe["inversores"]:
+                    resultado.inversores = equipamentos_pe["inversores"]
+                    resultado.fonte_inversores = nome
+            except Exception as exc:
+                resultado.erros.append(f"[erro ao reconhecer equipamentos de projeto executivo em {nome}: {exc}]")
 
     return resultado

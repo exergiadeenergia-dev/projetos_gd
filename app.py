@@ -529,11 +529,17 @@ def painel_busca_drive(tipo: str) -> dict:
                     "Marca e modelo continuam em branco de propósito (vieram de um pedido de kit): "
                     "confirme pelas tabelas do INMETRO antes de gerar."
                 )
+                fonte_equip = []
+                if resultado.paineis:
+                    fonte_equip.append(f"painéis de {resultado.fonte_paineis}")
+                if resultado.inversores:
+                    fonte_equip.append(f"inversores de {resultado.fonte_inversores}")
                 st.info(
                     f"📦 Achei {len(resultado.paineis)} modelo(s) de painel e "
-                    f"{len(resultado.inversores)} modelo(s) de inversor — "
+                    f"{len(resultado.inversores)} modelo(s) de inversor (" + " · ".join(fonte_equip) + ") — "
                     "quantidade e potência já foram pras tabelas de Painéis/Inversores (ou "
-                    "Módulos/Inversores) abaixo. " + aviso_marca_modelo
+                    "Módulos/Inversores) abaixo — o primeiro arquivo em que cada um aparece é o único "
+                    "usado, pra não duplicar o mesmo equipamento se mais de um arquivo mencionar. " + aviso_marca_modelo
                 )
 
         return st.session_state.get(chave_confirmado, {})
@@ -946,6 +952,7 @@ def gerar_energisa(dados):
         # download recarrega a página. Sem isso, os botões (e os arquivos)
         # somem depois do primeiro clique.
         st.session_state["saida_energisa"] = {
+            "nome_base": nome_base,
             "xlsm_bytes": xlsm_path.read_bytes(), "xlsm_nome": xlsm_path.name,
             "pdf_bytes": pdf_final.read_bytes(), "pdf_nome": pdf_final.name,
             "aneel_bytes": aneel_path.read_bytes(), "aneel_nome": aneel_path.name,
@@ -968,7 +975,7 @@ def mostrar_downloads_energisa():
         (saida["pdf_nome"], saida["pdf_bytes"]),
         (saida["aneel_nome"], saida["aneel_bytes"]),
     ])
-    c4.download_button("📦 Baixar tudo (.zip)", zip_bytes, "documentos_energisa.zip",
+    c4.download_button("📦 Baixar tudo (.zip)", zip_bytes, f"documentos_{saida['nome_base']}.zip",
                         key="dl_zip_energisa", type="primary")
 
 
@@ -1339,6 +1346,7 @@ def gerar_equatorial(dados, foto_upload):
         # Guarda os bytes na sessão (a pasta temporária é apagada ao sair
         # deste bloco, e clicar num botão de download recarrega a página).
         st.session_state["saida_equatorial"] = {
+            "nome_base": nome_base,
             "avisos": avisos,
             "anexo_xlsx_bytes": xlsx_path.read_bytes(), "anexo_xlsx_nome": xlsx_path.name,
             "anexo_pdf_bytes": anexo_pdf.read_bytes(), "anexo_pdf_nome": anexo_pdf.name,
@@ -1378,7 +1386,7 @@ def mostrar_downloads_equatorial():
         (saida["comiss_docx_nome"], saida["comiss_docx_bytes"]),
         (saida["comiss_pdf_nome"], saida["comiss_pdf_bytes"]),
     ])
-    c7.download_button("📦 Baixar tudo (.zip)", zip_bytes, "documentos_equatorial.zip",
+    c7.download_button("📦 Baixar tudo (.zip)", zip_bytes, f"documentos_{saida['nome_base']}.zip",
                         key="dl_zip_equatorial", type="primary")
     st.info("Lembrete: as seções de dimensionamento do Memorial (disjuntor, DPS, "
             "aterramento, cabos, levantamento de carga) usam os valores de referência — revise manualmente.")
