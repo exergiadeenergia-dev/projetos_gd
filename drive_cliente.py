@@ -535,13 +535,21 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
       todos da MESMA frase, numa lista numerada e pontuada; é o padrão
       preferido porque não depende de juntar rótulos espalhados pela
       página.
+    - "NN — Marca/Modelo:" numa linha e o valor "FABRICANTE/MODELO" na
+      seguinte (formato do carimbo SFCR/Energisa-MT) — módulo: cruza com a
+      conta "qtd * unit = total" pra confirmar a quantidade; inversor: exige
+      que a mesma sequência seja seguida por "Tipo:"+"Potência:" (só bate
+      no bloco do inversor, não no do módulo nem no do DPS) e só assume 1
+      inversor quando a potência dele bate exatamente com a "Potência
+      Nominal" do sistema informada em outro ponto do documento — nunca
+      quando os dois números não conferem entre si.
     - "15 * 600 Wp = 9 kWp" — variante sem marca/modelo, mas com a própria
       conta como conferência: se quantidade × potência unitária não bater
       com o total informado (tolerância pequena, só pra arredondamento), o
       achado é descartado inteiro.
     - Inversor por rótulos separados (FABRICANTE:/MODELO:/POTÊNCIA NOMINAL
       CA:, ou os rótulos genéricos Quantidade/Potência/Tensão de saída) —
-      usado só como reforço quando a frase-lista não aparece; exige que os
+      usado só como último reforço quando nada acima aparece; exige que os
       rótulos relevantes apareçam TODOS antes de montar a linha, nunca
       completa com um valor não confirmado.
 
@@ -580,6 +588,92 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
                             "modelo": m.group(3).strip().upper(),
                             "potencia_kw": kw, "tensao_nominal_v": ""})
 
+    # --- rótulo "Marca/Modelo:" (formato do carimbo SFCR/Energisa-MT) ---
+    # Um desenho CAD multi-coluna faz o OCR embaralhar o texto: entre o
+    # rótulo e o valor real pode entrar um pedaço de outra coluna (ex.:
+    # "Marca/Modelo:\n1000V ) Leapton /LP182-...") e a potência unitária
+    # (Wp) quase nunca fica logo depois — normalmente vem de outra parte
+    # da página. Por isso a busca aqui é em duas etapas independentes, sem
+    # exigir que tudo fique junto:
+    #   1) acha o par "Palavra / Palavra-com-número" mais próximo depois do
+    #      rótulo (dentro de uma janela curta, ignorando o que vier antes
+    #      dele) — funciona mesmo com lixo de OCR pelo meio, porque exige
+    #      a barra "/" explícita entre marca e modelo, que não aparece por
+    #      acaso em texto aleatório;
+    #   2) só aceita esse achado como dado do MÓDULO (não do inversor nem
+    #      do DPS/protetor de surto — que também usam o mesmo rótulo "Marca
+    #      /Modelo:" no mesmo carimbo) se ele vier ANTES da menção a "DPS"
+    #      no texto — no layout real testado, a ordem é sempre módulo,
+    #      depois DPS, depois inversor.
+    #   A quantidade nunca é advinhada aqui: só usa o achado se, em
+    #   QUALQUER outro ponto do mesmo texto, existir uma conta "qtd * unit
+    #   = total" batendo exatamente com essa potência unitária — a mesma
+    #   conferência por aritmética já usada na variante sem marca/modelo
+    #   logo abaixo.
+    _candidatos_marca_modelo = [
+        m for m in re.finditer(r"Marca\s*/?\s*Modelo\s*:\s*", texto, re.IGNORECASE)
+        if not re.search(r"DPS", texto[max(0, m.start() - 60): m.start()], re.IGNORECASE)
+    ]
+
+    def _valor_marca_modelo(pos_fim: int):
+        janela = texto[pos_fim: pos_fim + 150]
+        return re.search(r"([A-Za-zÀ-ÿ]{3,})\s*/\s*([\w][\w\-—–]{2,}?)(?=[\s.;,)]|$)", janela)
+
+    # --- mesmo carimbo numerado ("01 — Marca/Modelo:", "02 — Potência
+    # nominal:", "03 — Quantidade:" ...), mas versão SEM ruído de OCR entre
+    # os rótulos (texto digitado/copiado direto, não escaneado) — como
+    # aqui a "Quantidade:" e a "Potência nominal:" aparecem legíveis logo
+    # depois do par marca/modelo, não precisa da conta de conferência: lê
+    # os dois valores direto, cada um do seu próprio rótulo. A janela fica
+    # travada até o PRÓXIMO "Marca/Modelo:" (ou uma extensão pequena, se
+    # não houver um próximo) — pra nunca vazar um número do bloco do
+    # inversor pro do módulo ou vice-versa.
+    if not paineis and _candidatos_marca_modelo:
+        cand = _candidatos_marca_modelo[0]
+        fim_janela = _candidatos_marca_modelo[1].start() if len(_candidatos_marca_modelo) > 1 else cand.end() + 500
+        mv = _valor_marca_modelo(cand.end())
+        if mv:
+            janela = texto[cand.end(): fim_janela]
+            m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", janela, re.IGNORECASE)
+            m_pot = re.search(r"Pot[êe]ncia(?:\s*nominal)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*Wp?\b", janela, re.IGNORECASE)
+            if m_qtd and m_pot:
+                try:
+                    watts_unit = float(m_pot.group(1).replace(",", "."))
+                except ValueError:
+                    watts_unit = None
+                if watts_unit:
+                    paineis.append({
+                        "quantidade": int(m_qtd.group(1)),
+                        "fabricante": mv.group(1).strip().upper(),
+                        "modelo": mv.group(2).strip(" -—–").upper().replace("—", "-").replace("–", "-"),
+                        "area_m2": 0, "potencia_kw": round(watts_unit / 1000, 3),
+                    })
+
+    # --- mesmo formato, mas OCR ruidoso e "Quantidade:" ilegível — usa a
+    # conta "qtd * unit = total" (achada em qualquer ponto do texto) como
+    # conferência da quantidade em vez de ler o rótulo direto.
+    if not paineis and _candidatos_marca_modelo:
+        mv = _valor_marca_modelo(_candidatos_marca_modelo[0].end())
+        if mv:
+            fabricante = mv.group(1).strip().upper()
+            modelo = mv.group(2).strip(" -—–").upper().replace("—", "-").replace("–", "-")
+            for m2 in re.finditer(
+                r"(\d+)\s*[\*x]\s*(\d+)\s*Wp?\s*=\s*(\d+(?:[.,]\d+)?)\s*kWp?",
+                texto, re.IGNORECASE,
+            ):
+                qtd, watts_unit = int(m2.group(1)), int(m2.group(2))
+                try:
+                    total_informado = float(m2.group(3).replace(",", "."))
+                except ValueError:
+                    continue
+                total_calculado = qtd * watts_unit / 1000
+                if abs(total_calculado - total_informado) <= max(0.05, total_informado * 0.02):
+                    paineis.append({
+                        "quantidade": qtd, "fabricante": fabricante, "modelo": modelo,
+                        "area_m2": 0, "potencia_kw": round(watts_unit / 1000, 3),
+                    })
+                    break
+
     # --- variante sem marca/modelo, só com a conta de conferência ---
     if not paineis:
         for m in re.finditer(
@@ -596,13 +690,76 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
                 paineis.append({"quantidade": qtd, "fabricante": "", "modelo": "",
                                  "area_m2": 0, "potencia_kw": round(watts_unit / 1000, 3)})
 
-    # --- inversor por rótulos separados (reforço, só se a frase-lista não achou nada) ---
+    # --- mesmo carimbo numerado, versão SEM ruído de OCR — lê "Quantidade:"
+    # e "Potencia:" direto dos rótulos do bloco do inversor (o último
+    # candidato não-DPS), sem precisar da conferência aritmética. Janela
+    # travada a ~500 caracteres depois do rótulo (não tem um próximo
+    # "Marca/Modelo:" depois do inversor pra travar nele).
+    if not inversores and _candidatos_marca_modelo:
+        cand = _candidatos_marca_modelo[-1]
+        mv = _valor_marca_modelo(cand.end())
+        if mv:
+            janela = texto[cand.end(): cand.end() + 500]
+            m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", janela, re.IGNORECASE)
+            m_pot = re.search(r"Pot[êe]ncia\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*kW\b", janela, re.IGNORECASE)
+            if m_qtd and m_pot:
+                try:
+                    potencia_unit = float(m_pot.group(1).replace(",", "."))
+                except ValueError:
+                    potencia_unit = None
+                if potencia_unit:
+                    inversores.append({
+                        "quantidade": int(m_qtd.group(1)),
+                        "fabricante": mv.group(1).strip().upper(),
+                        "modelo": mv.group(2).strip(" -—–").upper().replace("—", "-").replace("–", "-"),
+                        "potencia_kw": potencia_unit, "tensao_nominal_v": "",
+                    })
+
+    # --- rótulo "Marca/Modelo:" pro INVERSOR (mesmo carimbo SFCR/
+    # Energisa-MT), mas OCR ruidoso e "Quantidade:" ilegível — usa os
+    # mesmos candidatos já filtrados acima (exclui o DPS), pega o ÚLTIMO em
+    # vez do primeiro: na ordem real do texto é sempre módulo, DPS,
+    # inversor — então, tirando o DPS, o último que sobra é o inversor. Só
+    # assume 1 inversor quando isso é CONFIRMÁVEL: a potência dele bate
+    # exatamente com a "Potência Nominal" do sistema informada em outro
+    # ponto do documento (um único inversor já cobre a potência total).
+    # Nunca advinha quantidade quando os dois números não batem — nesse
+    # caso o inversor simplesmente não entra na lista, pra confirmação
+    # manual.
+    if not inversores and len(_candidatos_marca_modelo) > 1:
+        mv = _valor_marca_modelo(_candidatos_marca_modelo[-1].end())
+        if mv:
+            fabricante = mv.group(1).strip().upper()
+            modelo = mv.group(2).strip(" -—–").upper().replace("—", "-").replace("–", "-")
+            m_pot = re.search(
+                r"Pot[êe]ncia\s*:\s*(\d+(?:[.,]\d+)?)\s*kW",
+                texto[_candidatos_marca_modelo[-1].end(): _candidatos_marca_modelo[-1].end() + 200],
+                re.IGNORECASE,
+            )
+            m_total = re.search(r"Pot[êe]ncia\s*Nominal\s*:\s*(\d+(?:[.,]\d+)?)\s*kW", texto, re.IGNORECASE)
+            if m_pot and m_total:
+                try:
+                    potencia_unit = float(m_pot.group(1).replace(",", "."))
+                    potencia_total = float(m_total.group(1).replace(",", "."))
+                except ValueError:
+                    potencia_unit = potencia_total = None
+                if potencia_unit and potencia_total and abs(potencia_total - potencia_unit) <= max(0.05, potencia_total * 0.02):
+                    inversores.append({
+                        "quantidade": 1, "fabricante": fabricante, "modelo": modelo,
+                        "potencia_kw": potencia_unit, "tensao_nominal_v": "",
+                    })
+
+    # --- inversor por rótulos separados (reforço, só se nada acima achou) ---
     if not inversores:
         m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", texto, re.IGNORECASE)
         m_pot = re.search(r"Pot[êe]ncia(?:\s*Nominal)?(?:\s*CA)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*k?W\b", texto, re.IGNORECASE)
         m_tensao = re.search(r"Tens[ãa]o\s*de\s*sa[íi]da\s*[:\-]?\s*(\d{2,3})\s*V\b", texto, re.IGNORECASE)
         m_fab = re.search(r"FABRICANTE\s*[:\-]?\s*([A-ZÀ-Ú][\w\-]*)", texto, re.IGNORECASE)
-        m_mod = re.search(r"\bMODELO\s*[:\-]?\s*([A-Za-z0-9][\w\-\.]*)", texto, re.IGNORECASE)
+        # (?<!Marca/) evita casar o "Modelo:" que faz parte do rótulo
+        # combinado "Marca/Modelo:" tratado nos blocos acima — aqui o
+        # rótulo tem que ser "MODELO:" sozinho, senão o fabricante do
+        # módulo pode vazar pra dentro do inversor por engano.
+        m_mod = re.search(r"(?<!Marca/)(?<!Marca /)\bMODELO\s*[:\-]?\s*([A-Za-z0-9][\w\-\.]*)", texto, re.IGNORECASE)
         if m_qtd and m_pot and m_tensao:
             potencia = float(m_pot.group(1).replace(",", "."))
             if potencia > 100:  # veio em W, não kW (ex.: "POTÊNCIA NOMINAL CA: 5000")
@@ -783,17 +940,74 @@ def _ocr_imagem(conteudo: bytes) -> str:
         return pytesseract.image_to_string(img, lang="eng")
 
 
-def _ocr_pdf_escaneado(conteudo: bytes) -> str:
-    """Renderiza cada página do PDF como imagem (PyMuPDF, sem depender de
-    binário externo tipo poppler) e roda OCR em cada uma — usado só quando
-    o PDF não tem camada de texto (foto/scan salvo como PDF)."""
+# Renderizar uma folha de projeto grande (ex.: prancha A1/A0 de "Diagrama
+# Unifilar", ~33x23 polegadas) a 250dpi pode passar de 40 megapixels — o
+# OCR disso sozinho já levou mais de 50s numa página real testada nesta
+# conversa, e isso somado a vários arquivos assim na mesma pasta é o tipo
+# de uso de CPU sustentado que o Streamlit Cloud (plano gratuito) detecta
+# e reage reduzindo a CPU do app ("throttling"), deixando tudo mais lento
+# e capaz de derrubar a leitura no meio. Por isso o lado maior da imagem
+# nunca passa deste limite — abaixo disso o dpi pedido continua valendo
+# (folhas A4 comuns, por exemplo, não são afetadas nem de longe).
+#
+# CUIDADO: um teste real (nesta mesma conversa) mostrou que baixar o dpi
+# de propósito, como forma "rotineira" de economizar tempo, piora a OCR o
+# suficiente pra ler número errado — em 150dpi (numa folha de 33"), um "5"
+# virou "S" no modelo de um inversor ("5KTLM-G3" -> "SKTLM-G3") e um "9"
+# virou "2" num CPF, o que é sério (dado errado que PARECE confirmado) e,
+# de quebra, ainda escapa da deduplicação por igualdade exata
+# (`_sem_duplicatas`), aparecendo como linha duplicada. E o ganho de tempo
+# nem foi tão grande assim (~40s contra ~51s a 250dpi de verdade) — não
+# compensa o risco. Por isso este teto fica ALTO: só existe como rede de
+# segurança pra folha absurdamente grande ou PDF com imagem em dpi nativo
+# muito alto (evita estourar memória/CPU num caso extremo), não como jeito
+# de acelerar o caso comum. Numa folha real de 33x23" a 250dpi (a maior
+# testada nesta conversa) dá ~8275px de lado maior — este teto fica bem
+# acima disso de propósito, pra não interferir na resolução desses casos.
+MAX_PIXELS_LADO_MAIOR_OCR = 9000
+
+
+def _pixmap_ocr(pagina, dpi_alvo: int = 250, clip=None):
+    """`get_pixmap` com um teto de resolução — usa `dpi_alvo` até o lado
+    maior da imagem bater `MAX_PIXELS_LADO_MAIOR_OCR`; a partir daí reduz o
+    dpi efetivo pra não estourar isso, custe o que custar em nitidez (uma
+    OCR mais “grossa” ainda é melhor que travar/estourar CPU)."""
+    rect = clip if clip is not None else pagina.rect
+    lado_maior_pt = max(rect.width, rect.height, 1)
+    lado_maior_px_no_dpi_alvo = lado_maior_pt / 72 * dpi_alvo
+    if lado_maior_px_no_dpi_alvo > MAX_PIXELS_LADO_MAIOR_OCR:
+        dpi_alvo = max(72, int(MAX_PIXELS_LADO_MAIOR_OCR / (lado_maior_pt / 72)))
+    if clip is not None:
+        return pagina.get_pixmap(dpi=dpi_alvo, clip=clip)
+    return pagina.get_pixmap(dpi=dpi_alvo)
+
+
+def _ocr_pdf_escaneado(conteudo: bytes, paginas: list | None = None) -> str:
+    """Renderiza página(s) do PDF como imagem (PyMuPDF, sem depender de
+    binário externo tipo poppler) e roda OCR em cada uma. Sempre OCRa a
+    página INTEIRA (nunca um recorte) — um teste real já mostrou que
+    recortar só a região da imagem grande detectada PERDE dado quando o
+    carimbo/tabela é "texto vetorizado" (letras desenhadas como forma
+    dentro do PDF, sem código de caractere — comum em CAD exportado):
+    isso não é uma imagem raster nenhuma, então nem aparece nos bboxes de
+    imagem, só a página inteira rasterizada + OCR recupera.
+
+    `paginas`: quando o chamador já sabe QUAIS páginas têm chance de conter
+    dado novo (ex.: só as que têm uma imagem grande colada — ver
+    `_pdf_tem_imagem_grande`), passa a lista de índices aqui pra não gastar
+    CPU OCRando as demais páginas do documento à toa (elas já têm o texto
+    vetorial normal, que o pypdf/PyMuPDF já leram certinho). Se `None`
+    (caso do PDF "todo escaneado", onde não dá pra saber de antemão qual
+    página tem o quê), OCRa as primeiras `MAX_PAGINAS_OCR_PDF` em ordem."""
     import fitz  # PyMuPDF
     doc = fitz.open(stream=conteudo, filetype="pdf")
+    if paginas is not None:
+        indices = [i for i in paginas if 0 <= i < len(doc)][:MAX_PAGINAS_OCR_PDF]
+    else:
+        indices = list(range(min(len(doc), MAX_PAGINAS_OCR_PDF)))
     partes = []
-    for i, pagina in enumerate(doc):
-        if i >= MAX_PAGINAS_OCR_PDF:
-            break
-        pix = pagina.get_pixmap(dpi=250)
+    for i in indices:
+        pix = _pixmap_ocr(doc[i], dpi_alvo=250)
         partes.append(_ocr_imagem(pix.tobytes("png")))
     return "\n".join(partes)
 
@@ -858,18 +1072,28 @@ def _tem_imagem_grande(pagina) -> bool:
     return bool(_bboxes_imagens_grandes(pagina))
 
 
-def _pdf_tem_imagem_grande(conteudo: bytes) -> bool:
+def _paginas_com_imagem_grande(conteudo: bytes) -> list:
+    """Índices das páginas (até MAX_PAGINAS_OCR_PDF) que têm uma imagem
+    colada grande o bastante pra ser um carimbo/tabela de dados — usado
+    tanto pra DECIDIR se vale rodar OCR extra quanto pra saber EM QUAIS
+    páginas rodar (ver `_ocr_pdf_escaneado`), evitando OCR desnecessário
+    nas páginas que só têm texto vetorial normal."""
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(stream=conteudo, filetype="pdf")
+        achadas = []
         for i, pagina in enumerate(doc):
             if i >= MAX_PAGINAS_OCR_PDF:
                 break
             if _tem_imagem_grande(pagina):
-                return True
+                achadas.append(i)
+        return achadas
     except Exception:
-        return False
-    return False
+        return []
+
+
+def _pdf_tem_imagem_grande(conteudo: bytes) -> bool:
+    return bool(_paginas_com_imagem_grande(conteudo))
 
 
 
@@ -929,10 +1153,14 @@ def baixar_texto_arquivo(servico, arquivo: dict) -> tuple[str, bool]:
             # (nunca substitui o vetorial) e, do lado de quem consome esse
             # texto, listas de equipamento passam por `_sem_duplicatas`
             # antes de virar linha de tabela, pra essa releitura não virar
-            # linha duplicada.
+            # linha duplicada. E, pra economizar CPU (ver `MAX_PIXELS_LADO_
+            # MAIOR_OCR` acima), só OCRamos as páginas que de fato têm uma
+            # imagem grande colada — as demais páginas do mesmo documento já
+            # tiveram o texto vetorial lido certinho, não precisam de OCR.
             try:
-                if _pdf_tem_imagem_grande(conteudo):
-                    texto_ocr = _ocr_pdf_escaneado(conteudo)
+                paginas_alvo = _paginas_com_imagem_grande(conteudo)
+                if paginas_alvo:
+                    texto_ocr = _ocr_pdf_escaneado(conteudo, paginas=paginas_alvo)
                     if texto_ocr.strip():
                         return texto + "\n" + texto_ocr, True
             except Exception:
