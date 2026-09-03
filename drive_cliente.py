@@ -195,11 +195,20 @@ def extrair_dados_genericos(texto: str) -> dict:
     projetos Equatorial-GO, cujo formato de documentos ainda não foi
     validado com dados reais nesta ferramenta)."""
     dados = {}
-    m = re.search(r"CPF[\s/]*CNPJ\s*[:\-]?\s*([\d\.\-/]{11,18})", texto, re.IGNORECASE)
-    if m:
+    # Aceita tanto "CPF/CNPJ" quanto "CNPJ/CPF" (já vimos os dois rótulos
+    # em documentos reais) — mas pula qualquer ocorrência logo depois de
+    # "Autor do Projeto", que em Projetos Executivos/Diagramas Unifilares
+    # marca o CPF do ENGENHEIRO responsável, não do cliente. Pegar esse
+    # CPF por engano seria pior que não achar nenhum: pareceria conferido
+    # sem ser.
+    for m in re.finditer(r"C(?:PF[\s/]*CNPJ|NPJ[\s/]*CPF)\s*[:\-]?\s*([\d\.\-/,]{11,18})", texto, re.IGNORECASE):
+        janela_antes = texto[max(0, m.start() - 200): m.start()]
+        if re.search(r"autor\s+do\s+projeto", janela_antes, re.IGNORECASE):
+            continue
         digitos = re.sub(r"\D", "", m.group(1))
         if len(digitos) in (11, 14):
             dados["cpf_cnpj"] = digitos
+            break
     # CEP solto — mas pulando qualquer ocorrência logo depois da palavra
     # "Integrador", que em pedidos de kit (ex.: Solfácil) marca o endereço
     # da PRÓPRIA integradora/revenda, não o do cliente. Pegar esse CEP por
@@ -254,6 +263,21 @@ def extrair_endereco_bloco_cep(texto: str) -> dict:
     """
     dados = {}
     tu = texto.upper()
+    # A linha de logradouro/número/bairro (primeiro regex abaixo) é frouxa
+    # o bastante pra combinar com texto que não tem nada a ver com endereço
+    # (ex.: legendas de um desenho CAD tipo "PADRÃO DE ENTRADA...32 A -
+    # QUADRO DE PROTEÇÃO") — por isso só aceita esse achado quando o
+    # documento TAMBÉM tem a linha de "CEP ... - CIDADE" no formato exato
+    # deste layout; sem ela, não é seguro assumir que esse é mesmo um
+    # "espelho de conta" nesse formato.
+    m_cep = re.search(
+        r"\bCEP\s*[:\-]?\s*(\d{5}-?\d{3}|\d{8})\s*-\s*([A-ZÀ-Ú][A-ZÀ-Ú\s]*?)\s*(?:\n|$)",
+        tu,
+    )
+    if not m_cep:
+        return dados
+    dados["cep"] = re.sub(r"\D", "", m_cep.group(1))
+    dados["cidade"] = m_cep.group(2).strip().title()
     m = re.search(
         r"\b([A-ZÀ-Ú][A-ZÀ-Ú\s\.]*?)\s+(\d+)(?:\s+\d{4,})?\s*-\s*"
         r"([A-ZÀ-Ú][A-ZÀ-Ú0-9º°.\s]*?)\s*(?:\n|$)",
@@ -263,13 +287,6 @@ def extrair_endereco_bloco_cep(texto: str) -> dict:
         dados["logradouro"] = m.group(1).strip().title()
         dados["numero"] = m.group(2).strip()
         dados["bairro"] = m.group(3).strip().title()
-    m = re.search(
-        r"\bCEP\s*[:\-]?\s*(\d{5}-?\d{3}|\d{8})\s*-\s*([A-ZÀ-Ú][A-ZÀ-Ú\s]*?)\s*(?:\n|$)",
-        tu,
-    )
-    if m:
-        dados["cep"] = re.sub(r"\D", "", m.group(1))
-        dados["cidade"] = m.group(2).strip().title()
     return dados
 
 
@@ -314,6 +331,22 @@ def extrair_coordenadas_livres(texto: str) -> dict:
     return dados
 
 
+def _sem_duplicatas(linhas: list) -> list:
+    """Remove linhas de equipamento EXATAMENTE iguais, mantendo a ordem —
+    evita duplicar uma linha quando o mesmo trecho do documento acaba lido
+    duas vezes por caminhos diferentes (ex.: o mesmo parágrafo aparece no
+    texto vetorial normal E de novo via OCR de página inteira, quando o
+    PDF tem um carimbo que precisa de OCR — ver `baixar_texto_arquivo`)."""
+    vistos = set()
+    resultado = []
+    for linha in linhas:
+        chave = tuple(sorted(linha.items()))
+        if chave not in vistos:
+            vistos.add(chave)
+            resultado.append(linha)
+    return resultado
+
+
 def extrair_equipamentos_pedido(texto: str) -> dict:
     """Quantidade e potência de módulos/inversores num 'Pedido' de kit
     solar (ex.: Solfácil) — ex.: "15x MODULO BIFACIAL 600W ... Disponível"
@@ -348,7 +381,236 @@ def extrair_equipamentos_pedido(texto: str) -> dict:
         v = m.group(3)
         inversores.append({"quantidade": qtd, "fabricante": "", "modelo": "",
                             "potencia_kw": kw, "tensao_nominal_v": v})
-    return {"paineis": paineis, "inversores": inversores}
+    return {"paineis": _sem_duplicatas(paineis), "inversores": _sem_duplicatas(inversores)}
+
+
+def extrair_projeto_executivo(texto: str) -> dict:
+    """Campos do "Projeto Executivo" (diagrama unifilar de um SFCR —
+    Sistema Fotovoltaico Conectado à Rede) — o próprio desenho técnico do
+    projeto. Esse tipo de arquivo normalmente só é legível via OCR, porque
+    os dados (UC, interessado, endereço etc.) ficam num print/imagem colado
+    na página, não em texto vetorial de verdade — é por isso que
+    `baixar_texto_arquivo` roda OCR extra pra páginas assim (ver
+    `_tem_imagem_grande`), mesmo quando o PDF já tem algum texto normal.
+
+    OCR num desenho CAD de múltiplas colunas embaralha a ordem de leitura —
+    já confirmamos nesta mesma extração que os prefixos numerados ("01 —",
+    "05 —" etc.) aparecem fora de ordem/duplicados, e que dígitos isolados
+    podem vir trocados (ex.: "37,8V" lido como "57,8V"). Por segurança, essa
+    função só tenta os campos com RÓTULO próprio, curto e isolado o
+    suficiente pra não depender da ordem/posição no texto — nunca as
+    especificações elétricas densas (Imp/Isc/Vmp/Voc/eficiência) e nunca
+    marca/modelo de módulo/inversor (mesma regra de sempre: isso é
+    conferido manualmente pelo engenheiro nas tabelas do INMETRO, nunca
+    preenchido sozinho pelo app, mesmo estando escrito no documento)."""
+    dados = {}
+
+    # "N da UC:" às vezes sai truncado E duplicado no OCR (ex.: "N da
+    # UC:1.081.277.017-0 — N da UC:1.081.277.017-00") — fica com a
+    # ocorrência de MAIS dígitos, que é a versão completa.
+    ucs = re.findall(r"N\s*da\s*UC\s*[:\-]?\s*([\d\.\-]+)", texto, re.IGNORECASE)
+    if ucs:
+        melhor = max(ucs, key=lambda s: len(re.sub(r"\D", "", s)))
+        digitos = re.sub(r"\D", "", melhor)
+        if digitos:
+            dados["uc"] = digitos
+
+    m = re.search(r"Tipo\s*de\s*Conex[ãa]o\s*[:\-]?\s*(Mono|Bi|Tri)f[áa]sic[oa]", texto, re.IGNORECASE)
+    if m:
+        prefixo = m.group(1).upper()
+        dados["tipo_conexao"] = {"MONO": "MONOFÁSICO", "BI": "BIFÁSICO", "TRI": "TRIFÁSICO"}[prefixo]
+
+    # "Interessado:" (com dois-pontos, seguido do nome) é o dado real.
+    # "Interessado(a)" — sem dois-pontos, com "(a)" logo depois — é só o
+    # rótulo vazio da linha de assinatura no carimbo do desenho; o `:`
+    # exigido logo após a palavra já evita confundir os dois.
+    m = re.search(r"Interessado\s*:\s*([^\n]+)", texto, re.IGNORECASE)
+    if m:
+        nome = m.group(1).strip(" .")
+        if nome:
+            dados["titular"] = nome.title()
+
+    # "Local:" — formato próprio deste documento, diferente dos outros
+    # layouts de endereço já tratados: "RUA Carajas, 286 — Centro. — Barra
+    # do Garças" (a UF costuma continuar na linha seguinte do OCR, onde o
+    # risco de embaralhamento é maior — por segurança não tentamos capturar
+    # a UF aqui; o formulário já usa "MT" como padrão).
+    m = re.search(r"\bLocal\s*:\s*([^\n]+)", texto, re.IGNORECASE)
+    if m:
+        m2 = re.match(
+            r"\s*(.+?),\s*(\d+[A-Za-z]?)\s*[—–-]\s*(.+?)\.?\s*[—–-]\s*(.+?)\s*$",
+            m.group(1),
+        )
+        if m2:
+            dados["logradouro"] = m2.group(1).strip().title()
+            dados["numero"] = m2.group(2).strip()
+            dados["bairro"] = m2.group(3).strip().title()
+            dados["cidade"] = m2.group(4).strip().title()
+
+    # ---- Variante "Diagrama Unifilar" (ex.: modelo usado nos projetos
+    # Equatorial-GO) — carimbo próprio, diferente do formato acima. Também
+    # só é legível via OCR (mesmo motivo: título do desenho colado como
+    # imagem), mas o carimbo aqui é limpo e cada rótulo aparece uma única
+    # vez, sem o embaralhamento de colunas visto no diagrama CAD do outro
+    # formato — por isso dá pra confiar num pouco mais de campo aqui.
+    m = re.search(r"UNIDADE\s+CONSUMIDORA\s*\(N[ºo°]\)\s*[:\-]?\s*([\d\.\-]+)", texto, re.IGNORECASE)
+    if m and "uc" not in dados:
+        digitos = re.sub(r"\D", "", m.group(1))
+        if digitos:
+            dados["uc"] = digitos
+
+    m = re.search(r"CIDADE\s+DA\s+OBRA\s*[:\-]?\s*([^\n]+?)\s*(?:SETOR\s+DA\s+OBRA|$)", texto, re.IGNORECASE)
+    if m and "cidade" not in dados:
+        cidade = m.group(1).strip(" .")
+        if cidade:
+            dados["cidade"] = cidade.title()
+
+    # "SETOR DA OBRA" é o nome que documentos de Goiás costumam dar ao que,
+    # nos outros formatos, chamamos de "bairro" — mapeado direto pro mesmo
+    # campo do formulário.
+    m = re.search(r"SETOR\s+DA\s+OBRA\s*[:\-]?\s*([^\n]+)", texto, re.IGNORECASE)
+    if m and "bairro" not in dados:
+        bairro = m.group(1).strip(" .")
+        if bairro:
+            dados["bairro"] = bairro.title()
+
+    # "PROPRIETARIO:" com o nome (e, logo depois, o CNPJ/CPF) é o titular
+    # real deste carimbo — bem distinto do "AUTOR DO PROJETO:" (o
+    # engenheiro responsável, nunca o cliente). Exigir o rótulo
+    # "PROPRIETARIO" imediatamente antes evita qualquer confusão entre os
+    # dois nomes que aparecem no mesmo carimbo.
+    m = re.search(
+        r"PROPRIETARIO\s*:?\s*\n*\s*([A-ZÀ-Ú][A-Za-zÀ-ÿ\s]+?)\s*CNPJ\s*/?\s*CPF\s*[:\-]?\s*([\d,\.\-/]{11,18})",
+        texto, re.IGNORECASE,
+    )
+    if m:
+        nome = m.group(1).strip(" .")
+        if nome and "titular" not in dados:
+            dados["titular"] = nome.title()
+        digitos = re.sub(r"\D", "", m.group(2))
+        if len(digitos) in (11, 14) and "cpf_cnpj" not in dados:
+            dados["cpf_cnpj"] = digitos
+
+    # "POTÊNCIA TOTAL INSTALADA/INVERSORES" é a potência que a
+    # concessionária efetivamente aprova (a do inversor, não a dos
+    # módulos) — é esse número que corresponde ao campo "Potência
+    # Instalada" do formulário. Só usa o "POTÊNCIA:" mais genérico do
+    # carimbo se o rótulo específico não aparecer.
+    m = (
+        re.search(r"POT[ÊE]NCIA\s+TOTAL\s+INSTALADA\s*/\s*INVERSORES\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*kWp?", texto, re.IGNORECASE)
+        or re.search(r"\bPOT[ÊE]NCIA\s*[:\-]\s*(\d+(?:[.,]\d+)?)\s*kW\b", texto, re.IGNORECASE)
+    )
+    if m and "potencia_instalada_kw" not in dados:
+        try:
+            dados["potencia_instalada_kw"] = float(m.group(1).replace(",", "."))
+        except ValueError:
+            pass
+
+    return dados
+
+
+def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
+    """Quantidade, potência e — só para este tipo de documento, por
+    decisão explícita do usuário — marca/modelo de módulos/inversores a
+    partir do Projeto Executivo/Diagrama Unifilar. Diferente do pedido de
+    kit de um revendedor (onde marca/modelo seguem SEMPRE em branco, pra
+    confirmação manual nas tabelas do INMETRO), este é o próprio desenho
+    técnico final assinado pelo engenheiro responsável — o usuário confirmou
+    que esses dados podem ser considerados corretos aqui.
+
+    Mesmo assim, o texto costuma vir de OCR (o carimbo é colado como
+    imagem) e um desenho CAD multi-coluna pode embaralhar a ordem de
+    leitura — então só tenta padrões que dá pra CONFERIR contra si mesmos
+    ou que vêm de uma frase estruturada única e isolada, nunca monta linha
+    "quase certa" juntando pedaços de lugares diferentes do texto:
+
+    - Frase-lista ("1. 10 Módulos Fotovoltaicos de 600 Wp, marca LEAPTON,
+      modelo LP182-182-M-72-NB;" / "2. 1 Inversores marca SOFAR, um modelo
+      5KTLM-G3, potência pico AC 5 kW") — quantidade, marca e modelo saem
+      todos da MESMA frase, numa lista numerada e pontuada; é o padrão
+      preferido porque não depende de juntar rótulos espalhados pela
+      página.
+    - "15 * 600 Wp = 9 kWp" — variante sem marca/modelo, mas com a própria
+      conta como conferência: se quantidade × potência unitária não bater
+      com o total informado (tolerância pequena, só pra arredondamento), o
+      achado é descartado inteiro.
+    - Inversor por rótulos separados (FABRICANTE:/MODELO:/POTÊNCIA NOMINAL
+      CA:, ou os rótulos genéricos Quantidade/Potência/Tensão de saída) —
+      usado só como reforço quando a frase-lista não aparece; exige que os
+      rótulos relevantes apareçam TODOS antes de montar a linha, nunca
+      completa com um valor não confirmado.
+
+    Tudo que essa função encontra continua marcado como OCR
+    (`via_ocr=True` em quem chama) pra pedir atenção redobrada na
+    conferência, mesmo com marca/modelo agora preenchidos."""
+    paineis, inversores = [], []
+
+    # --- frase-lista: "N Módulos Fotovoltaicos de P Wp, marca M, modelo D" ---
+    for m in re.finditer(
+        r"(\d+)\s*M[óo]dulos?\s*Fotovoltaicos?\s*de\s*(\d+(?:[.,]\d+)?)\s*Wp\s*,?\s*"
+        r"marca\s+([A-ZÀ-Ú][\w\-]*)\s*,?\s*modelo\s+([A-Za-z0-9][\w\-\.]*)",
+        texto, re.IGNORECASE,
+    ):
+        qtd = int(m.group(1))
+        try:
+            watts_unit = float(m.group(2).replace(",", "."))
+        except ValueError:
+            continue
+        paineis.append({"quantidade": qtd, "fabricante": m.group(3).strip().upper(),
+                         "modelo": m.group(4).strip().upper(),
+                         "area_m2": 0, "potencia_kw": round(watts_unit / 1000, 3)})
+
+    # --- frase-lista: "N Inversores marca M, [um] modelo D, potência pico AC P kW" ---
+    for m in re.finditer(
+        r"(\d+)\s*Inversores?\s*marca\s+([A-ZÀ-Ú][\w\-]*)\s*,?\s*(?:um\s+)?modelo\s+([A-Za-z0-9][\w\-\.]*)\s*,?\s*"
+        r"pot[êe]ncia\s*pico\s*AC\s*(\d+(?:[.,]\d+)?)\s*kW",
+        texto, re.IGNORECASE,
+    ):
+        qtd = int(m.group(1))
+        try:
+            kw = float(m.group(4).replace(",", "."))
+        except ValueError:
+            continue
+        inversores.append({"quantidade": qtd, "fabricante": m.group(2).strip().upper(),
+                            "modelo": m.group(3).strip().upper(),
+                            "potencia_kw": kw, "tensao_nominal_v": ""})
+
+    # --- variante sem marca/modelo, só com a conta de conferência ---
+    if not paineis:
+        for m in re.finditer(
+            r"(\d+)\s*[\*x]\s*(\d+)\s*Wp?\s*=\s*(\d+(?:[.,]\d+)?)\s*kWp?",
+            texto, re.IGNORECASE,
+        ):
+            qtd, watts_unit = int(m.group(1)), int(m.group(2))
+            try:
+                total_informado = float(m.group(3).replace(",", "."))
+            except ValueError:
+                continue
+            total_calculado = qtd * watts_unit / 1000
+            if abs(total_calculado - total_informado) <= max(0.05, total_informado * 0.02):
+                paineis.append({"quantidade": qtd, "fabricante": "", "modelo": "",
+                                 "area_m2": 0, "potencia_kw": round(watts_unit / 1000, 3)})
+
+    # --- inversor por rótulos separados (reforço, só se a frase-lista não achou nada) ---
+    if not inversores:
+        m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", texto, re.IGNORECASE)
+        m_pot = re.search(r"Pot[êe]ncia(?:\s*Nominal)?(?:\s*CA)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*k?W\b", texto, re.IGNORECASE)
+        m_tensao = re.search(r"Tens[ãa]o\s*de\s*sa[íi]da\s*[:\-]?\s*(\d{2,3})\s*V\b", texto, re.IGNORECASE)
+        m_fab = re.search(r"FABRICANTE\s*[:\-]?\s*([A-ZÀ-Ú][\w\-]*)", texto, re.IGNORECASE)
+        m_mod = re.search(r"\bMODELO\s*[:\-]?\s*([A-Za-z0-9][\w\-\.]*)", texto, re.IGNORECASE)
+        if m_qtd and m_pot and m_tensao:
+            potencia = float(m_pot.group(1).replace(",", "."))
+            if potencia > 100:  # veio em W, não kW (ex.: "POTÊNCIA NOMINAL CA: 5000")
+                potencia = round(potencia / 1000, 3)
+            inversores.append({
+                "quantidade": int(m_qtd.group(1)),
+                "fabricante": m_fab.group(1).strip().upper() if m_fab else "",
+                "modelo": m_mod.group(1).strip().upper() if m_mod else "",
+                "potencia_kw": potencia,
+                "tensao_nominal_v": m_tensao.group(1),
+            })
+
+    return {"paineis": _sem_duplicatas(paineis), "inversores": _sem_duplicatas(inversores)}
 
 
 CAMPOS_TIPO = {
@@ -356,15 +618,21 @@ CAMPOS_TIPO = {
     # propósito. Desse tipo de documento só se aproveita a lista de
     # equipamentos (via `extrair_equipamentos_pedido`, chamado à parte em
     # `levantamento_pasta`); endereço/UC/titular sempre vêm da conta de
-    # energia (ART/espelho/fatura), nunca do pedido do kit.
+    # energia (ART/espelho/fatura) ou do Projeto Executivo, nunca do pedido
+    # do kit.
+    # `extrair_projeto_executivo` roda logo depois da ART — antes dos
+    # extratores de padrão solto (endereço/contato/genérico) — porque os
+    # rótulos dele são específicos e menos propensos a "casar" com texto
+    # que não tem nada a ver (um risco real: já vimos um desenho CAD cheio
+    # de legendas técnicas enganar o regex frouxo de endereço solto).
     "energisa": (
-        extrair_dados_art, extrair_dados_conta_energisa, extrair_endereco_livre,
-        extrair_endereco_bloco_cep, extrair_contato_livre, extrair_coordenadas_livres,
-        extrair_dados_genericos,
+        extrair_dados_art, extrair_projeto_executivo, extrair_dados_conta_energisa,
+        extrair_endereco_livre, extrair_endereco_bloco_cep, extrair_contato_livre,
+        extrair_coordenadas_livres, extrair_dados_genericos,
     ),
     "equatorial": (
-        extrair_dados_art, extrair_endereco_livre, extrair_endereco_bloco_cep,
-        extrair_contato_livre, extrair_coordenadas_livres,
+        extrair_dados_art, extrair_projeto_executivo, extrair_endereco_livre,
+        extrair_endereco_bloco_cep, extrair_contato_livre, extrair_coordenadas_livres,
         extrair_dados_genericos,
     ),
 }
@@ -525,6 +793,82 @@ def _ocr_pdf_escaneado(conteudo: bytes) -> str:
     return "\n".join(partes)
 
 
+# Alguns PDFs "de verdade" (com texto vetorial normal, ex.: um desenho CAD
+# de "Projeto Executivo") têm TAMBÉM uma imagem colada (print/foto de uma
+# tabela de dados) grande o bastante pra conter a informação mais
+# importante da página — e nem pypdf nem o `get_text()` do PyMuPDF
+# enxergam o que está dentro de uma imagem. Esse caso não cai no fallback
+# de "PDF escaneado" acima porque o texto total já não é escasso (o
+# restante da página tem texto vetorial normal) — precisa de uma checagem
+# própria.
+FRACAO_MINIMA_IMAGEM_PAGINA = 0.20  # cobre boa parte da página (scan comum)
+# Alternativa em tamanho ABSOLUTO — necessária pra folhas grandes (ex.: uma
+# prancha de projeto A1/A0), onde uma imagem colada com uma tabela de dados
+# legível (poucas polegadas de lado, mas com boa resolução de pixel) fica
+# pequena PERTO do total da folha e não bateria o critério de fração acima.
+# Validado contra um "Projeto Executivo" real: imagem 1378x961px colada
+# numa área de ~6,4x4,5 polegadas (461x322pt) de uma folha de ~33x23
+# polegadas — passa nos dois critérios abaixo, mas ficaria bem abaixo de
+# 20% da área da folha.
+LARGURA_MINIMA_PT = 150
+ALTURA_MINIMA_PT = 150
+PIXELS_MINIMOS_IMAGEM = 300 * 300
+
+
+def _bboxes_imagens_grandes(pagina, fracao_minima: float = FRACAO_MINIMA_IMAGEM_PAGINA) -> list:
+    """Devolve os bboxes das imagens da página grandes o bastante — em
+    fração da página OU em tamanho absoluto com resolução decente — pra
+    ser, provavelmente, uma tabela/bloco de dados colado como print em vez
+    de desenhado como texto. Usado tanto pra DECIDIR se roda OCR extra
+    quanto, quando roda, pra saber ONDE recortar (ver `_ocr_regioes_imagem_
+    grande` — recortar só essas regiões, em vez de OCRar a página inteira,
+    evita duplicar o texto vetorial que o pypdf/PyMuPDF já leu direito)."""
+    try:
+        area_pagina = pagina.rect.width * pagina.rect.height
+    except Exception:
+        return []
+    if area_pagina <= 0:
+        return []
+    achados = []
+    for img in pagina.get_images(full=True):
+        xref = img[0]
+        largura_px, altura_px = img[2], img[3]
+        try:
+            bboxes = pagina.get_image_rects(xref)
+        except Exception:
+            continue
+        for bbox in bboxes:
+            area_img = bbox.width * bbox.height
+            grande = area_img / area_pagina >= fracao_minima or (
+                bbox.width >= LARGURA_MINIMA_PT
+                and bbox.height >= ALTURA_MINIMA_PT
+                and largura_px * altura_px >= PIXELS_MINIMOS_IMAGEM
+            )
+            if grande:
+                achados.append(bbox)
+    return achados
+
+
+def _tem_imagem_grande(pagina) -> bool:
+    return bool(_bboxes_imagens_grandes(pagina))
+
+
+def _pdf_tem_imagem_grande(conteudo: bytes) -> bool:
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=conteudo, filetype="pdf")
+        for i, pagina in enumerate(doc):
+            if i >= MAX_PAGINAS_OCR_PDF:
+                break
+            if _tem_imagem_grande(pagina):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+
+
 def baixar_texto_arquivo(servico, arquivo: dict) -> tuple[str, bool]:
     """Baixa/exporta um arquivo e devolve (texto, veio_de_ocr). Devolve
     string vazia para tipos que não sabemos extrair texto."""
@@ -553,17 +897,41 @@ def baixar_texto_arquivo(servico, arquivo: dict) -> tuple[str, bool]:
             for pagina in reader.pages:
                 partes.append(pagina.extract_text() or "")
             texto = "\n".join(partes)
-            if len(re.sub(r"\s", "", texto)) >= LIMIAR_TEXTO_PDF_OK:
+            if len(re.sub(r"\s", "", texto)) < LIMIAR_TEXTO_PDF_OK:
+                # quase nenhum texto veio do PDF — provavelmente é uma
+                # foto/scan salvo como PDF, não um PDF "de verdade". Tenta
+                # OCR nas páginas antes de desistir do arquivo.
+                try:
+                    texto_ocr = _ocr_pdf_escaneado(conteudo)
+                except Exception:
+                    return texto, False
+                if len(texto_ocr.strip()) > len(texto.strip()):
+                    return texto_ocr, True
                 return texto, False
-            # quase nenhum texto veio do PDF — provavelmente é uma foto/scan
-            # salvo como PDF, não um PDF "de verdade". Tenta OCR nas páginas
-            # antes de desistir do arquivo.
+
+            # o PDF tem texto vetorial de verdade (não é um scan) — mas
+            # pode ter, além disso, um carimbo/tabela de dados que nenhum
+            # extrator de texto normal enxerga: seja uma imagem colada
+            # (print/foto) ou texto "vetorizado" (letras desenhadas como
+            # forma, sem código de caractere nenhum — comum em carimbo de
+            # CAD exportado). `_pdf_tem_imagem_grande` só detecta o primeiro
+            # caso, mas na prática o segundo também acontece (já confirmado
+            # com um documento real desta mesma conversa); por segurança
+            # rodamos OCR na página inteira sempre que uma imagem grande é
+            # detectada, mesmo sem saber ao certo qual dos dois é o motivo.
+            # Isso pode reler (via OCR) um trecho que o texto vetorial já
+            # tinha capturado — por isso o texto OCR é só ACRESCENTADO
+            # (nunca substitui o vetorial) e, do lado de quem consome esse
+            # texto, listas de equipamento passam por `_sem_duplicatas`
+            # antes de virar linha de tabela, pra essa releitura não virar
+            # linha duplicada.
             try:
-                texto_ocr = _ocr_pdf_escaneado(conteudo)
+                if _pdf_tem_imagem_grande(conteudo):
+                    texto_ocr = _ocr_pdf_escaneado(conteudo)
+                    if texto_ocr.strip():
+                        return texto + "\n" + texto_ocr, True
             except Exception:
-                return texto, False
-            if len(texto_ocr.strip()) > len(texto.strip()):
-                return texto_ocr, True
+                pass
             return texto, False
 
         if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
@@ -641,5 +1009,9 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
         equipamentos = extrair_equipamentos_pedido(texto)
         resultado.paineis.extend(equipamentos["paineis"])
         resultado.inversores.extend(equipamentos["inversores"])
+
+        equipamentos_pe = extrair_equipamentos_projeto_executivo(texto)
+        resultado.paineis.extend(equipamentos_pe["paineis"])
+        resultado.inversores.extend(equipamentos_pe["inversores"])
 
     return resultado
