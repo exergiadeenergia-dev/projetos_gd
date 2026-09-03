@@ -1,0 +1,11 @@
+# Tema escuro fixo, com o verde da marca Exergia como cor de destaque.
+# Sem esse arquivo, o app segue o tema do navegador/sistema de quem acessa
+# (pode aparecer claro pra alguém com o Windows/Chrome no modo claro); com
+# ele, fica sempre escuro pra todo mundo, igual nos seus prints.
+[theme]
+base = "dark"
+primaryColor = "#5FA032"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1C2128"
+textColor = "#FAFAFA"
+font = "sans serif"
