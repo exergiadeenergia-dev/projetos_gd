@@ -292,18 +292,23 @@ def extrair_endereco_bloco_cep(texto: str) -> dict:
 
 def extrair_contato_livre(texto: str) -> dict:
     """Celular e e-mail soltos no texto, sem rótulo — como aparecem em
-    alguns modelos de conta/espelho: um número de 11 dígitos (DDD + celular,
-    9 na frente) sozinho numa linha, com o e-mail perto (mesma linha ou a
-    seguinte). Só reconhece o número como celular quando um e-mail aparece
-    por perto, exatamente pra não confundir com um CPF solto de 11 dígitos
-    (que não tem essa relação com e-mail por perto) — CPF continua sendo
-    reconhecido só com o rótulo explícito em `extrair_dados_genericos`."""
+    alguns modelos de conta/espelho, e também num documento "cartão de
+    contato" curto (coordenadas + e-mail + celular, cada um em seu próprio
+    parágrafo, separados por linhas em branco — formato real confirmado
+    nesta conversa). Um número de 11 dígitos (DDD + celular, 9 na frente)
+    sozinho numa linha, com o e-mail por perto. "Por perto" ignora linhas
+    em branco entre os dois — olha a vizinhança pelas linhas de conteúdo
+    mais próximas, não pela posição bruta no texto, porque documentos como
+    esse "cartão" costumam ter cada dado em seu próprio parágrafo com uma
+    linha vazia entre eles. Só reconhece o número como celular quando um
+    e-mail aparece por perto, exatamente pra não confundir com um CPF
+    solto de 11 dígitos (que não tem essa relação com e-mail por perto) —
+    CPF continua sendo reconhecido só com o rótulo explícito em
+    `extrair_dados_genericos`."""
     dados = {}
-    linhas = [l.strip() for l in texto.split("\n")]
+    linhas = [l.strip() for l in texto.split("\n") if l.strip()]
     email_re = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
     for i, linha in enumerate(linhas):
-        if not linha:
-            continue
         vizinhas = " ".join(linhas[max(0, i - 1): i + 2])
         m_email = email_re.search(linha)
         if m_email and "email" not in dados:
@@ -1006,12 +1011,27 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
                 resultado.campos[campo] = valor
                 resultado.fontes[campo] = f"{nome} (OCR — confira com atenção redobrada)" if via_ocr else nome
 
-        equipamentos = extrair_equipamentos_pedido(texto)
-        resultado.paineis.extend(equipamentos["paineis"])
-        resultado.inversores.extend(equipamentos["inversores"])
+        # As duas extrações de equipamento abaixo, ao contrário de
+        # `extrair_campos_arquivo` (que já protege cada extrator
+        # individualmente), não tinham essa proteção — um erro inesperado
+        # aqui (num arquivo só) travava a função inteira e o Streamlit
+        # descartava TUDO que já tinha sido lido dos arquivos anteriores
+        # (campos incluídos), já que `painel_busca_drive` só salva o
+        # resultado depois que `levantamento_pasta` retorna com sucesso.
+        # Isolado por arquivo, do mesmo jeito, pra um problema aqui nunca
+        # apagar os campos que já tinham sido reconhecidos certinho.
+        try:
+            equipamentos = extrair_equipamentos_pedido(texto)
+            resultado.paineis.extend(equipamentos["paineis"])
+            resultado.inversores.extend(equipamentos["inversores"])
+        except Exception as exc:
+            resultado.erros.append(f"[erro ao reconhecer equipamentos de pedido em {nome}: {exc}]")
 
-        equipamentos_pe = extrair_equipamentos_projeto_executivo(texto)
-        resultado.paineis.extend(equipamentos_pe["paineis"])
-        resultado.inversores.extend(equipamentos_pe["inversores"])
+        try:
+            equipamentos_pe = extrair_equipamentos_projeto_executivo(texto)
+            resultado.paineis.extend(equipamentos_pe["paineis"])
+            resultado.inversores.extend(equipamentos_pe["inversores"])
+        except Exception as exc:
+            resultado.erros.append(f"[erro ao reconhecer equipamentos de projeto executivo em {nome}: {exc}]")
 
     return resultado
