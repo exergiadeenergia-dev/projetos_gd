@@ -142,7 +142,15 @@ def _idx(opcoes: list, valor, padrao: int = 0) -> int:
     return padrao
 
 
-st.set_page_config(page_title="Gerador GD — Exergia", page_icon="\u2600\ufe0f", layout="wide")
+LOGO_PATH = BASE / "logo_exergia.png"
+
+st.set_page_config(
+    page_title="Gerador GD — Exergia",
+    page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else "☀️",
+    layout="wide",
+)
+if LOGO_PATH.exists():
+    st.logo(str(LOGO_PATH), size="large")
 
 MODELO_ENERGISA = BASE / "memorialgd_1.xlsm"
 MODELO_ANEXO1 = BASE / "NT_00020_EQTL-06-Anexo-I-Formulario-de-Solicitacao.xlsx"
@@ -340,9 +348,13 @@ def _guia_configuracao_drive():
 
 def painel_busca_drive(tipo: str) -> dict:
     """Mostra a busca da pasta do cliente no Drive + o levantamento
-    automático dos dados em quadros editáveis pra conferência. Devolve um
-    dict de valores prontos pra pré-preencher o formulário manual logo
-    abaixo (vazio se o usuário não usou o Drive nesta sessão)."""
+    automático dos dados. Assim que o levantamento roda, os campos
+    encontrados já descem direto pro formulário manual logo abaixo — não
+    tem uma segunda etapa de confirmação aqui; a conferência e a edição
+    acontecem direto nos campos do formulário (que é a própria "tela de
+    confirmar"), e o botão de gerar já existente lá embaixo é o único
+    passo final. Devolve um dict de valores pra pré-preencher esse
+    formulário (vazio se o usuário não usou o Drive nesta sessão)."""
     chave_resultado = f"drive_resultado_{tipo}"
     chave_pastas = f"drive_pastas_{tipo}"
     chave_confirmado = f"drive_confirmado_{tipo}"
@@ -384,6 +396,12 @@ def painel_busca_drive(tipo: str) -> dict:
                     try:
                         resultado = drive_cliente.levantamento_pasta(pasta_id, tipo)
                         st.session_state[chave_resultado] = resultado
+                        # já aplica direto no formulário manual abaixo — sem
+                        # etapa extra de confirmação aqui em cima.
+                        campos = dict(resultado.campos)
+                        if tipo == "equatorial":
+                            campos = {MAPA_CAMPOS_EQUATORIAL.get(c, c): v for c, v in campos.items()}
+                        st.session_state[chave_confirmado] = campos
                     except Exception as exc:
                         st.error(f"Erro durante o levantamento: {exc}")
 
@@ -400,29 +418,15 @@ def painel_busca_drive(tipo: str) -> dict:
             if not resultado.campos:
                 st.warning("Não consegui reconhecer nenhum dado nos arquivos dessa pasta. "
                            "Preencha manualmente abaixo ou use a opção de colar texto.")
-                return st.session_state.get(chave_confirmado, {})
-
-            st.write("**Confira e corrija os valores antes de usar no formulário abaixo** "
-                     "— são um ponto de partida, não confie sem revisar:")
-
-            editado = {}
-            cols = st.columns(3)
-            for i, (campo, valor) in enumerate(sorted(resultado.campos.items())):
-                fonte = resultado.fontes.get(campo, "")
-                novo = cols[i % 3].text_input(
-                    f"{campo}  ·  fonte: {fonte}", value=str(valor), key=f"drive_campo_{tipo}_{campo}",
+            else:
+                linhas_fonte = "\n".join(
+                    f"- **{campo}**: {valor}  ·  fonte: {resultado.fontes.get(campo, '')}"
+                    for campo, valor in sorted(resultado.campos.items())
                 )
-                editado[campo] = novo
-
-            if st.button("✅ Usar estes dados no formulário abaixo", key=f"drive_btn_confirmar_{tipo}", type="primary"):
-                if tipo == "equatorial":
-                    convertido = {}
-                    for campo, valor in editado.items():
-                        convertido[MAPA_CAMPOS_EQUATORIAL.get(campo, campo)] = valor
-                    editado = convertido
-                st.session_state[chave_confirmado] = editado
-                st.success("Dados aplicados! Role até o formulário manual abaixo — os campos já "
-                           "vêm preenchidos, confira mais uma vez antes de gerar os documentos.")
+                st.success(
+                    "Campos já aplicados no formulário abaixo — role até lá pra conferir e "
+                    "corrigir cada um antes de clicar em Gerar documentos:\n\n" + linhas_fonte
+                )
 
         return st.session_state.get(chave_confirmado, {})
 
@@ -1168,7 +1172,13 @@ def mostrar_downloads_equatorial():
 # ============================================================
 # MAIN
 # ============================================================
-st.title("☀️ Gerador de Documentos GD — Exergia")
+if LOGO_PATH.exists():
+    col_logo, col_titulo = st.columns([1, 5], vertical_alignment="center")
+    col_logo.image(str(LOGO_PATH), width=110)
+    col_titulo.title("Gerador de Documentos GD")
+else:
+    st.title("☀️ Gerador de Documentos GD — Exergia")
+
 concessionaria = st.sidebar.radio("Concessionária", ["Energisa-MT", "Equatorial-GO"])
 st.sidebar.markdown("---")
 st.sidebar.caption("Preenchimento automático de projetos de Geração Distribuída, "
