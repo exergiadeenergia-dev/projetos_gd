@@ -775,6 +775,54 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
     return {"paineis": _sem_duplicatas(paineis), "inversores": _sem_duplicatas(inversores)}
 
 
+def eh_documento_fabricante_equipamento(texto: str) -> bool:
+    """Detecta documentos que descrevem o EQUIPAMENTO em si — registro/
+    certificado do Inmetro ou datasheet técnico de módulo/inversor —, nunca
+    o cliente ou a instalação. Esses documentos sempre têm o endereço,
+    e-mail e telefone da FABRICANTE (ou de quem registrou o equipamento no
+    Inmetro), nunca do cliente — foi exatamente isso que causou o bug
+    reportado pelo usuário: o CEP e o e-mail do fabricante (SOFARSOLAR e
+    Leapton, respectivamente) foram parar nos campos de endereço/contato do
+    formulário porque os extratores soltos de endereço/e-mail/CEP rodavam
+    sobre QUALQUER arquivo da pasta, sem levar em conta o tipo de
+    documento.
+
+    Regra do usuário, confirmada nesta conversa: endereço sempre vem da ART
+    ou da conta de energia; localização/e-mail/telefone sempre vêm do
+    "cartão de contato" do cliente; specs/quantidade de equipamento sempre
+    vêm do diagrama + datasheet + registro do Inmetro. Ou seja, um datasheet
+    ou registro do Inmetro é uma fonte válida de EQUIPAMENTO, mas nunca de
+    endereço/contato — por isso esta função só é usada pra pular os
+    extratores soltos de endereço/contato/CEP (`extrair_endereco_livre`,
+    `extrair_endereco_bloco_cep`, `extrair_contato_livre`,
+    `extrair_coordenadas_livres`, `extrair_dados_genericos`); a extração de
+    equipamentos (`extrair_equipamentos_projeto_executivo`,
+    `extrair_equipamentos_pedido`) continua rodando normalmente sobre esses
+    arquivos, exatamente como antes.
+
+    Os marcadores abaixo são conferidos com o texto real de um registro do
+    Inmetro e de um datasheet (Leapton) nesta mesma conversa."""
+    tu = texto.upper()
+    # Página de consulta de registro do Inmetro (registro.inmetro.gov.br) —
+    # cabeçalho fixo, sempre presente nesse formato.
+    if (
+        "REGISTRO.INMETRO.GOV.BR" in tu
+        or "AVALIAÇÃO DA CONFORMIDADE" in tu
+        or "AVALIACAO DA CONFORMIDADE" in tu
+        or "PROGRAMA DE AVALIAÇÃO DA CONFORMIDADE" in tu
+    ):
+        return True
+    # Datasheet técnico de módulo/inversor — exige pelo menos 2 marcadores
+    # (não só 1), pra não confundir com um documento qualquer que por
+    # acaso menciona um único termo técnico em comum.
+    marcadores = (
+        "ELECTRICAL PARAMETERS", "MECHANICAL DIAGRAMS", "TEMPERATURE CHARACTERISTICS",
+        "PACKING CONFIGURATION", "OPERATING TEMPERATURE", "STANDARD TEST CONDITIONS",
+        "TEMPERATURE COEFFICIENT", "MPPT VOLTAGE RANGE",
+    )
+    return sum(1 for marcador in marcadores if marcador in tu) >= 2
+
+
 CAMPOS_TIPO = {
     # Repare que não tem nenhum extrator de "Pedido de kit solar" aqui — de
     # propósito. Desse tipo de documento só se aproveita a lista de
@@ -1238,9 +1286,16 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
             resultado.arquivos_ignorados.append(nome)
             continue
 
-        resultado.arquivos_lidos.append(f"{nome} (OCR)" if via_ocr else nome)
         texto = texto[:MAX_CARACTERES_POR_ARQUIVO]
-        achados = extrair_campos_arquivo(texto, tipo)
+        # Documento de fabricante do equipamento (registro Inmetro,
+        # datasheet) — endereço/e-mail/telefone/CEP soltos aí são sempre da
+        # fabricante, nunca do cliente, então os extratores de
+        # endereço/contato/genérico NEM RODAM sobre esse texto. A extração
+        # de equipamentos (logo abaixo) continua normal.
+        eh_fabricante = eh_documento_fabricante_equipamento(texto)
+        tag_fonte = " (fabricante do equipamento — não usado p/ endereço/contato)" if eh_fabricante else ""
+        resultado.arquivos_lidos.append(f"{nome} (OCR){tag_fonte}" if via_ocr else f"{nome}{tag_fonte}")
+        achados = {} if eh_fabricante else extrair_campos_arquivo(texto, tipo)
         for campo, valor in achados.items():
             if campo not in resultado.campos:
                 resultado.campos[campo] = valor
