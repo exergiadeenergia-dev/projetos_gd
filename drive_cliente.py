@@ -676,24 +676,48 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
     #      dele) — funciona mesmo com lixo de OCR pelo meio, porque exige
     #      a barra "/" explícita entre marca e modelo, que não aparece por
     #      acaso em texto aleatório;
-    #   2) só aceita esse achado como dado do MÓDULO (não do inversor nem
-    #      do DPS/protetor de surto — que também usam o mesmo rótulo "Marca
-    #      /Modelo:" no mesmo carimbo) se ele vier ANTES da menção a "DPS"
-    #      no texto — no layout real testado, a ordem é sempre módulo,
-    #      depois DPS, depois inversor.
+    #   2) só aceita esse achado como dado do MÓDULO ou do INVERSOR (nunca
+    #      do DPS/protetor de surto — que também usa o mesmo rótulo "Marca
+    #      /Modelo:" no mesmo carimbo) se o rótulo vier no formato numerado
+    #      "NN — Marca/Modelo:" (com um número do item logo antes do
+    #      traço). Testado contra um SFCR real (cliente Maria Geogirna
+    #      Rodrigues) onde isso importa de verdade: o carimbo do DPS usa
+    #      "Marca/Modelo:" SOZINHO, sem número na frente, enquanto módulo e
+    #      inversor sempre têm o número do item ("01 — Marca/Modelo:").
+    #      Uma tentativa anterior excluía o DPS procurando a palavra "DPS"
+    #      nos 60 caracteres antes do rótulo — mas o OCR desse mesmo
+    #      documento embaralha a ordem de leitura a ponto de "DPS" aparecer
+    #      perto do rótulo do INVERSOR (excluindo o inversor por engano) e
+    #      longe do rótulo do próprio DPS (deixando o DPS passar por
+    #      engano) — os dois erros aconteceram ao mesmo tempo no mesmo
+    #      arquivo. Exigir o número resolve isso sem depender da ordem de
+    #      leitura embaralhada.
     #   A quantidade nunca é advinhada aqui: só usa o achado se, em
     #   QUALQUER outro ponto do mesmo texto, existir uma conta "qtd * unit
     #   = total" batendo exatamente com essa potência unitária — a mesma
     #   conferência por aritmética já usada na variante sem marca/modelo
     #   logo abaixo.
-    _candidatos_marca_modelo = [
-        m for m in re.finditer(r"Marca\s*/?\s*Modelo\s*:\s*", texto, re.IGNORECASE)
-        if not re.search(r"DPS", texto[max(0, m.start() - 60): m.start()], re.IGNORECASE)
-    ]
+    _candidatos_marca_modelo = list(re.finditer(
+        r"[O0]?\d{1,2}\s*[-—–]\s*Marca\s*/?\s*Modelo\s*:\s*", texto, re.IGNORECASE
+    ))
 
     def _valor_marca_modelo(pos_fim: int):
         janela = texto[pos_fim: pos_fim + 150]
-        return re.search(r"([A-Za-zÀ-ÿ]{3,})\s*/\s*([\w][\w\-—–]{2,}?)(?=[\s.;,)]|$)", janela)
+        m = re.search(r"([A-Za-zÀ-ÿ]{3,})\s*/\s*([\w][\w\-—–]{2,}?)(?=[\s.;,)]|$)", janela)
+        if not m:
+            return None
+        # Um modelo de equipamento real sempre tem letra E número juntos
+        # (ex.: "TS585S8T-144GANT", "MIN10000TL-X", "LP182-182-M-72-NB").
+        # Um valor só de letras ou só de números aqui é sinal de que o OCR
+        # embaralhou texto de outra parte da página (título do desenho,
+        # data, "Segue para...") pro lado do rótulo — descarta em vez de
+        # arriscar um dado errado (confirmado com o mesmo SFCR real: sem
+        # esse filtro o rótulo do módulo casava com "Setembro/2028", do
+        # carimbo de data do desenho).
+        modelo = m.group(2)
+        if not (re.search(r"[A-Za-z]", modelo) and re.search(r"\d", modelo)):
+            return None
+        return m
 
     # --- mesmo carimbo numerado ("01 — Marca/Modelo:", "02 — Potência
     # nominal:", "03 — Quantidade:" ...), mas versão SEM ruído de OCR entre
@@ -711,7 +735,7 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
         if mv:
             janela = texto[cand.end(): fim_janela]
             m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", janela, re.IGNORECASE)
-            m_pot = re.search(r"Pot[êe]ncia(?:\s*nominal)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*Wp?\b", janela, re.IGNORECASE)
+            m_pot = re.search(r"Pot[êeé]ncia(?:\s*nominal)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*Wp?\b", janela, re.IGNORECASE)
             if m_qtd and m_pot:
                 try:
                     watts_unit = float(m_pot.group(1).replace(",", "."))
@@ -777,7 +801,7 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
         if mv:
             janela = texto[cand.end(): cand.end() + 500]
             m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", janela, re.IGNORECASE)
-            m_pot = re.search(r"Pot[êe]ncia\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*kW\b", janela, re.IGNORECASE)
+            m_pot = re.search(r"Pot[êeé]ncia\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*kW\b", janela, re.IGNORECASE)
             if m_qtd and m_pot:
                 try:
                     potencia_unit = float(m_pot.group(1).replace(",", "."))
@@ -808,11 +832,11 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
             fabricante = mv.group(1).strip().upper()
             modelo = mv.group(2).strip(" -—–").upper().replace("—", "-").replace("–", "-")
             m_pot = re.search(
-                r"Pot[êe]ncia\s*:\s*(\d+(?:[.,]\d+)?)\s*kW",
+                r"Pot[êeé]ncia\s*:\s*(\d+(?:[.,]\d+)?)\s*kW",
                 texto[_candidatos_marca_modelo[-1].end(): _candidatos_marca_modelo[-1].end() + 200],
                 re.IGNORECASE,
             )
-            m_total = re.search(r"Pot[êe]ncia\s*Nominal\s*:\s*(\d+(?:[.,]\d+)?)\s*kW", texto, re.IGNORECASE)
+            m_total = re.search(r"Pot[êeé]ncia\s*Nominal\s*:\s*(\d+(?:[.,]\d+)?)\s*kW", texto, re.IGNORECASE)
             if m_pot and m_total:
                 try:
                     potencia_unit = float(m_pot.group(1).replace(",", "."))
@@ -828,7 +852,7 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
     # --- inversor por rótulos separados (reforço, só se nada acima achou) ---
     if not inversores:
         m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", texto, re.IGNORECASE)
-        m_pot = re.search(r"Pot[êe]ncia(?:\s*Nominal)?(?:\s*CA)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*k?W\b", texto, re.IGNORECASE)
+        m_pot = re.search(r"Pot[êeé]ncia(?:\s*Nominal)?(?:\s*CA)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*k?W\b", texto, re.IGNORECASE)
         m_tensao = re.search(r"Tens[ãa]o\s*de\s*sa[íi]da\s*[:\-]?\s*(\d{2,3})\s*V\b", texto, re.IGNORECASE)
         m_fab = re.search(r"FABRICANTE\s*[:\-]?\s*([A-ZÀ-Ú][\w\-]*)", texto, re.IGNORECASE)
         # (?<!Marca/) evita casar o "Modelo:" que faz parte do rótulo
