@@ -394,6 +394,14 @@ def campo_colar_dados(exemplo: str, ajuda_blocos: str) -> dict | None:
 # ============================================================
 NOME_TIPO = {"energisa": "Energisa-MT", "equatorial": "Equatorial-GO"}
 
+# UF que cada concessionária atende — usado só pra avisar o usuário quando a
+# pasta lida claramente é de outro estado (ex.: ART com "UF: GO" levantada no
+# formulário Energisa-MT). Nunca bloqueia nada no drive_cliente.py em si (a
+# extração continua igual pros dois estados); é só uma conferência a mais no
+# app, pra pegar cedo o caso de escolher a aba errada por engano.
+UF_ESPERADA_POR_TIPO = {"energisa": "MT", "equatorial": "GO"}
+NOME_UF = {"MT": "Mato Grosso", "GO": "Goiás"}
+
 # de campo do levantamento (dict `campos` do drive_cliente) -> chave usada
 # nos widgets do formulário manual de cada concessionária. Onde o nome é
 # igual dos dois lados a entrada nem precisa aparecer aqui.
@@ -488,30 +496,62 @@ def painel_busca_drive(tipo: str) -> dict:
                     try:
                         resultado = drive_cliente.levantamento_pasta(pasta_id, tipo)
                         st.session_state[chave_resultado] = resultado
-                        # já aplica direto no formulário manual abaixo — sem
-                        # etapa extra de confirmação aqui em cima.
-                        campos = dict(resultado.campos)
-                        if tipo == "equatorial":
-                            campos = _remapear_para_equatorial(campos)
-                        st.session_state[chave_confirmado] = campos
-                        # quantidade/potência de módulo e inversor achadas num
-                        # pedido de kit solar (marca/modelo sempre em branco,
-                        # pra confirmar manualmente) — guardadas à parte dos
-                        # `campos` escalares porque são listas de linhas.
-                        st.session_state[f"drive_paineis_{tipo}"] = resultado.paineis
-                        st.session_state[f"drive_inversores_{tipo}"] = resultado.inversores
-                        # nova "versão" de leitura: os campos do formulário
-                        # abaixo usam isso na key pra nascer de novo com os
-                        # valores atuais (mesmo que o usuário já tivesse
-                        # digitado algo de uma leitura anterior/outro
-                        # cliente) — mas sem depender do rótulo (que muda de
-                        # cor), então digitar num campo não reseta ele.
-                        chave_versao = f"drive_versao_{tipo}"
-                        st.session_state[chave_versao] = st.session_state.get(chave_versao, 0) + 1
+
+                        # Confere se a UF achada nos arquivos (ART/conta de
+                        # energia) bate com a concessionária selecionada —
+                        # pega cedo o caso de escolher a aba errada por
+                        # engano (ex.: pasta de cliente do GO levantada no
+                        # formulário Energisa-MT). Só compara quando a UF foi
+                        # de fato encontrada; sem ART/conta legível não dá
+                        # pra saber, então não bloqueia nada nesse caso.
+                        uf_encontrada = (resultado.campos.get("uf") or "").strip().upper()
+                        uf_esperada = UF_ESPERADA_POR_TIPO.get(tipo)
+                        if uf_encontrada and uf_esperada and uf_encontrada != uf_esperada:
+                            st.session_state[f"drive_uf_mismatch_{tipo}"] = uf_encontrada
+                            # não aplica nada no formulário — evita levar
+                            # endereço/UC de um estado pro documento do outro.
+                        else:
+                            st.session_state[f"drive_uf_mismatch_{tipo}"] = None
+                            # já aplica direto no formulário manual abaixo —
+                            # sem etapa extra de confirmação aqui em cima.
+                            campos = dict(resultado.campos)
+                            if tipo == "equatorial":
+                                campos = _remapear_para_equatorial(campos)
+                            st.session_state[chave_confirmado] = campos
+                            # quantidade/potência de módulo e inversor achadas
+                            # num pedido de kit solar (marca/modelo sempre em
+                            # branco, pra confirmar manualmente) — guardadas à
+                            # parte dos `campos` escalares porque são listas
+                            # de linhas.
+                            st.session_state[f"drive_paineis_{tipo}"] = resultado.paineis
+                            st.session_state[f"drive_inversores_{tipo}"] = resultado.inversores
+                            # nova "versão" de leitura: os campos do
+                            # formulário abaixo usam isso na key pra nascer de
+                            # novo com os valores atuais (mesmo que o usuário
+                            # já tivesse digitado algo de uma leitura
+                            # anterior/outro cliente) — mas sem depender do
+                            # rótulo (que muda de cor), então digitar num
+                            # campo não reseta ele.
+                            chave_versao = f"drive_versao_{tipo}"
+                            st.session_state[chave_versao] = st.session_state.get(chave_versao, 0) + 1
                     except Exception as exc:
                         st.error(f"Erro durante o levantamento: {exc}")
 
+        uf_mismatch = st.session_state.get(f"drive_uf_mismatch_{tipo}")
         resultado = st.session_state.get(chave_resultado)
+        if uf_mismatch:
+            st.error(
+                f"🚫 Essa pasta parece ser de um cliente de **{NOME_UF.get(uf_mismatch, uf_mismatch)} "
+                f"({uf_mismatch})**, mas você está no formulário **{NOME_TIPO[tipo]}**. "
+                "Nada foi preenchido automaticamente, pra não levar endereço/dados de um estado "
+                "pro documento do outro. Selecione **"
+                + NOME_TIPO["equatorial" if tipo == "energisa" else "energisa"]
+                + "** em \"Concessionária\", no menu à esquerda, e refaça o levantamento nessa pasta."
+            )
+            if resultado and resultado.arquivos_lidos:
+                st.caption("Arquivos lidos (só pra conferência): " + ", ".join(resultado.arquivos_lidos))
+            return st.session_state.get(chave_confirmado, {})
+
         if resultado:
             if resultado.arquivos_lidos:
                 st.success("Arquivos lidos: " + ", ".join(resultado.arquivos_lidos))

@@ -191,14 +191,35 @@ def extrair_dados_art(texto: str) -> dict:
     else:
         # 2) sem rótulo "Rua:" (CREA-GO) — o logradouro vem solto, logo
         #    depois do CPF/CNPJ do contratante, terminando em ", Nº ...
-        #    Bairro:".
+        #    Bairro:" — o número (ou "SN" de "sem número") sai do mesmo
+        #    achado, num segundo grupo.
         m = re.search(
             r"CPF/CNPJ:\s*[\d\.\-/]+\s*([A-Za-zÀ-ÿ0-9°º\s\.]+?)\s*,\s*"
-            r"N[ºo°]\s*\S+\s*Bairro:",
+            r"N[ºo°]\s*(\S+)\s*Bairro:",
             t,
         )
         if m:
             dados["logradouro"] = m.group(1).strip().title()
+            dados["numero"] = m.group(2).strip().upper()
+
+    # Número — só existe rótulo próprio "Número:" no formato CREA-MT (no
+    # CREA-GO ele já sai junto do logradouro, acima, via ", Nº ..."). Testado
+    # contra um SFCR real (cliente Maria Georgina Rodrigues Guimarães) onde
+    # esse campo aparecia na ART mas nunca tinha sido extraído — o usuário
+    # confirmou que "o restante [do endereço que faltava] é da ART", e esse
+    # rótulo realmente está lá ("Número: 14"), só não estava sendo lido. O
+    # lookbehind evita casar com "Nosso Número:" (um código de registro do
+    # CREA, sem nada a ver com endereço, que aparece mais adiante na mesma
+    # ART) — sem essa guarda, "Nosso Número: 00037041380002433855" seria um
+    # dado errado ainda pior que não achar nada.
+    if "numero" not in dados:
+        m = re.search(
+            r"(?<!Nosso\s)N[úu]mero:\s*(\S+)\s*"
+            r"(?=Bairro:|Rua:|Cidade:|Complemento:|CEP:)",
+            t,
+        )
+        if m:
+            dados["numero"] = m.group(1).strip().upper()
 
     # Bairro — mesma lógica do logradouro: pára no primeiro rótulo
     # conhecido, nunca faz a captura "andar" até um "CEP:"/"Rua:"/"Cidade:"
