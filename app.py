@@ -148,9 +148,29 @@ def _pendente(key: str, defaults: dict, campo: str, valor_padrao: str = "") -> b
     volta num "" que não é o valor real que vai aparecer na tela.
     "0"/"0.0" também conta como vazio aqui — é o valor inicial de um
     number_input sem dado nenhum (ex.: Potência Instalada), nunca um
-    resultado de engenharia válido por si só."""
+    resultado de engenharia válido por si só.
+
+    Tem mais um instante em que isso precisa de cuidado: toda vez que um
+    NOVO levantamento automático roda, `key` muda de versão (`_k` inclui
+    um contador que só sobe nesse momento — veja `_k` logo abaixo) bem de
+    propósito, pra Streamlit não ignorar o valor novo (é assim que o
+    Streamlit funciona: depois que uma key já existe em `session_state`,
+    passar um `value=` diferente na mesma key não tem efeito — por isso a
+    key precisa "nascer de novo"). Só que essa mesma key nova, por
+    definição, AINDA não existe em `session_state` no instante em que
+    ESTA função roda — porque `_rotulo`/`_pendente` são chamados como
+    argumento do widget, ou seja, ANTES do próprio widget (mais adiante
+    na mesma linha) criar a key. Sem tratar esse caso à parte, um campo
+    recém-lido do Drive aparecia com o valor certo na caixa e ainda assim
+    com o aviso vermelho "não encontrado" por cima — bug real, visto ao
+    vivo num levantamento desta conversa. Quando a key ainda não existe,
+    usa o valor que TÁ INDO pro widget (`defaults`, o resultado do
+    levantamento que acabou de rodar) como se já fosse o valor atual."""
     if not defaults:
         return False
+    if key not in st.session_state:
+        valor_novo = str(defaults.get(campo, valor_padrao)).strip()
+        return valor_novo in ("", "0", "0.0")
     valor_atual = str(st.session_state.get(key, valor_padrao)).strip()
     return valor_atual in ("", "0", "0.0")
 
