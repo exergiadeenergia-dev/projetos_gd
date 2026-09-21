@@ -1247,6 +1247,71 @@ def _pdf_tem_imagem_grande(conteudo: bytes) -> bool:
     return bool(_paginas_com_imagem_grande(conteudo))
 
 
+# Tamanho mínimo (largura × altura, em pixels) pra uma imagem embutida no
+# PDF contar como candidata a "foto de localização" — abaixo disso é mais
+# provável ser um logo/carimbo/assinatura do que um print de mapa. Visto
+# num Diagrama Unifilar real desta conversa: o print de satélite tinha
+# 2645×1479px, a assinatura do engenheiro (que aparece duas vezes na
+# mesma página) tinha só 562×238px — bem abaixo do limiar.
+MIN_PIXELS_IMAGEM_LOCALIZACAO = 400 * 300
+
+
+def _eh_diagrama_com_imagem_situacao(texto: str) -> bool:
+    """Reconhece o Diagrama Unifilar/Bloco pelo título fixo do carimbo —
+    esse é o tipo de documento que, na prática, sempre traz colado o print
+    do mapa/satélite ("SITUAÇÃO DA UNIDADE CONSUMIDORA") junto com o
+    desenho técnico. Usado só pra decidir em qual arquivo vale a pena
+    procurar essa imagem (evita abrir e escanear TODO PDF da pasta atrás
+    de imagens à toa)."""
+    tu = texto.upper()
+    return "DIAGRAMA UNIFILAR" in tu or "SITUAÇÃO DA UNIDADE CONSUMIDORA" in tu
+
+
+def extrair_imagem_situacao_diagrama(conteudo_pdf: bytes) -> bytes | None:
+    """Acha e devolve (em PNG) a maior imagem colada no Diagrama Unifilar —
+    na prática, sempre o print de mapa/satélite ("SITUAÇÃO DA UNIDADE
+    CONSUMIDORA"), nunca a assinatura do engenheiro ou outro carimbo
+    pequeno, porque esses são sempre muito menores (confirmado com um
+    Diagrama Unifilar real nesta conversa: o print de mapa tinha ~13x mais
+    área em pixels que a assinatura). Usada pra preencher automaticamente
+    a "foto de localização" do Memorial Descritivo (Equatorial-GO) sem
+    depender do usuário subir separadamente uma imagem que ele já tem
+    colada nesse outro arquivo. Devolve None se não achar nenhuma imagem
+    grande o bastante (`MIN_PIXELS_IMAGEM_LOCALIZACAO`) — nunca inventa
+    um recorte da própria página como se fosse a foto."""
+    try:
+        import fitz  # PyMuPDF
+        from PIL import Image
+
+        doc = fitz.open(stream=conteudo_pdf, filetype="pdf")
+        melhor = None  # (area_px, bytes_png)
+        for pagina in doc:
+            for info in pagina.get_images(full=True):
+                xref = info[0]
+                try:
+                    base = doc.extract_image(xref)
+                except Exception:
+                    continue
+                largura, altura = base.get("width", 0), base.get("height", 0)
+                area = largura * altura
+                if area < MIN_PIXELS_IMAGEM_LOCALIZACAO:
+                    continue
+                if melhor is not None and area <= melhor[0]:
+                    continue
+                try:
+                    # Converte pra PNG (o slot de imagem do modelo do
+                    # Memorial Descritivo é PNG — ver `substituir_foto_
+                    # localizacao`), mesmo que a imagem original seja JPEG.
+                    img = Image.open(io.BytesIO(base["image"])).convert("RGB")
+                    saida = io.BytesIO()
+                    img.save(saida, format="PNG")
+                    melhor = (area, saida.getvalue())
+                except Exception:
+                    continue
+        return melhor[1] if melhor else None
+    except Exception:
+        return None
+
 
 
 def baixar_texto_arquivo(servico, arquivo: dict) -> tuple[str, bool]:
@@ -1363,6 +1428,13 @@ class ResultadoLevantamento:
     inversores: list = field(default_factory=list)
     fonte_paineis: str = ""
     fonte_inversores: str = ""
+    # Print de mapa/satélite recortado automaticamente do Diagrama Unifilar
+    # (ver `extrair_imagem_situacao_diagrama`) — usado pra pré-preencher a
+    # "foto de localização" do Memorial Descritivo sem o usuário precisar
+    # subir de novo uma imagem que ele já colou nesse outro arquivo. Mesma
+    # regra de "primeiro arquivo que achar, ganha" dos demais campos.
+    imagem_localizacao: bytes | None = None
+    fonte_imagem_localizacao: str = ""
 
 
 def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
@@ -1450,5 +1522,26 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
                     resultado.fonte_inversores = nome
             except Exception as exc:
                 resultado.erros.append(f"[erro ao reconhecer equipamentos de projeto executivo em {nome}: {exc}]")
+
+        # Print de mapa/satélite colado no Diagrama Unifilar — reaproveita
+        # pra pré-preencher a "foto de localização" do Memorial Descritivo,
+        # sem o usuário precisar subir de novo uma imagem que ele já tem
+        # nesse outro arquivo. Só tenta em PDF (é onde essa imagem colada
+        # existe) reconhecido pelo carimbo do Diagrama Unifilar, e só baixa
+        # os bytes brutos do arquivo (2º download, só desse arquivo) quando
+        # essas condições batem — não baixa à toa pra todo PDF da pasta.
+        if (
+            resultado.imagem_localizacao is None
+            and arquivo["mimeType"] == "application/pdf"
+            and _eh_diagrama_com_imagem_situacao(texto)
+        ):
+            try:
+                conteudo_pdf = servico.files().get_media(fileId=arquivo["id"]).execute()
+                imagem = extrair_imagem_situacao_diagrama(conteudo_pdf)
+                if imagem:
+                    resultado.imagem_localizacao = imagem
+                    resultado.fonte_imagem_localizacao = nome
+            except Exception as exc:
+                resultado.erros.append(f"[erro ao recortar imagem de localização de {nome}: {exc}]")
 
     return resultado

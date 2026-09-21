@@ -562,6 +562,19 @@ def painel_busca_drive(tipo: str) -> dict:
                     "usado, pra não duplicar o mesmo equipamento se mais de um arquivo mencionar. " + aviso_marca_modelo
                 )
 
+            if resultado.imagem_localizacao:
+                st.image(
+                    resultado.imagem_localizacao,
+                    caption=f"Foto de localização recortada automaticamente de {resultado.fonte_imagem_localizacao} "
+                            "— confira se é mesmo a marcação deste cliente antes de gerar.",
+                    width=420,
+                )
+                st.caption(
+                    "Vai ser usada como foto de localização no Memorial Descritivo. Se quiser trocar, "
+                    "suba outra na seção \"6. Foto de localização\" abaixo — o que você subir manualmente "
+                    "sempre tem prioridade sobre essa recortada automaticamente."
+                )
+
         return st.session_state.get(chave_confirmado, {})
 
 
@@ -1269,7 +1282,14 @@ dht_corrente_pct: 3"""
     )
 
     st.subheader("6. Foto de localização (opcional)")
-    foto = st.file_uploader("Print do mapa / foto de satélite com a marcação do imóvel", type=["png", "jpg", "jpeg"])
+    _resultado_drive_go = st.session_state.get("drive_resultado_equatorial")
+    _imagem_auto_go = getattr(_resultado_drive_go, "imagem_localizacao", None)
+    rotulo_foto = "Print do mapa / foto de satélite com a marcação do imóvel"
+    if _imagem_auto_go:
+        rotulo_foto += " (opcional — já recortamos uma automaticamente do Diagrama Unifilar acima; suba aqui só se quiser trocar)"
+    else:
+        rotulo_foto += " (opcional)"
+    foto = st.file_uploader(rotulo_foto, type=["png", "jpg", "jpeg"])
 
     gerar = st.button("Gerar documentos (Equatorial-GO)", type="primary")
 
@@ -1315,10 +1335,14 @@ dht_corrente_pct: 3"""
         }
         for aviso in avisos_campos_atencao(dados["cliente"], CAMPOS_ATENCAO_EQUATORIAL):
             st.warning(f"⚠️ {aviso}")
-        gerar_equatorial(dados, foto)
+        gerar_equatorial(dados, foto, imagem_auto=_imagem_auto_go)
 
 
-def gerar_equatorial(dados, foto_upload):
+def gerar_equatorial(dados, foto_upload, imagem_auto: bytes | None = None):
+    """`foto_upload` é o que o usuário subiu manualmente (widget do
+    Streamlit) — tem prioridade. `imagem_auto` é o print recortado
+    automaticamente do Diagrama Unifilar (`resultado.imagem_localizacao`
+    em `drive_cliente.py`), usado só quando ninguém subiu nada na mão."""
     nome_base = slug_arquivo(dados["cliente"]["nome"], dados["cliente"]["uc_existente"] or "SEMUC")
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -1334,9 +1358,13 @@ def gerar_equatorial(dados, foto_upload):
             qtd = sum(m["quantidade"] for m in dados["cliente"]["modulos"])
             pot = sum(m["potencia_w"] * m["quantidade"] for m in dados["cliente"]["modulos"]) / 1000
             fix_tabela_gerador(doc, qtd, pot)
-            if foto_upload is not None:
+            # Prioridade: foto que o usuário subiu na mão (ele pode ter
+            # trocado de propósito) > print recortado automaticamente do
+            # Diagrama Unifilar > nenhuma foto (mantém a do modelo).
+            foto_bytes = foto_upload.getvalue() if foto_upload is not None else imagem_auto
+            if foto_bytes:
                 foto_path = tmp / "foto_local.png"
-                foto_path.write_bytes(foto_upload.getvalue())
+                foto_path.write_bytes(foto_bytes)
                 substituir_foto_localizacao(doc, str(foto_path))
             memorial_path = tmp / f"{nome_base}_Memorial.docx"
             doc.save(str(memorial_path))
