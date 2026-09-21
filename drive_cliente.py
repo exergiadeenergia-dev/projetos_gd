@@ -134,26 +134,102 @@ def extrair_coordenadas(texto: str):
 
 def extrair_dados_art(texto: str) -> dict:
     """ART do CREA (qualquer estado) — título/contratante, CPF, endereço,
-    potência e coordenadas."""
+    potência e coordenadas.
+
+    Testado contra duas ARTs reais de estados diferentes nesta conversa, e
+    os dois formatos são BEM diferentes um do outro:
+      - CREA-MT: nome do contratante em CAIXA ALTA, rótulo "Rua:" separado
+        pro logradouro, "Cidade: X UF: Y" com rótulo de UF à parte, e a
+        ORDEM em que os rótulos aparecem no texto extraído do PDF (que
+        segue a ordem interna do PDF, não necessariamente a ordem visual
+        da página) intercala campos de um jeito que uma extração "até o
+        próximo rótulo tal" pode andar longe demais e pegar um pedaço de
+        campo errado no meio do caminho.
+      - CREA-GO: nome do contratante em Caixa Alta E Baixa (Title Case),
+        sem nenhum rótulo "Rua:" (o logradouro vem solto, logo depois do
+        CPF/CNPJ do contratante), bairro com rótulo "Bairro:", e cidade
+        e UF juntos num só campo ("Cidade: ARAGARÇAS-GO", sem "UF:"
+        separado), além da potência vindo em CAIXA ALTA e no plural
+        ("QUILOWATTS").
+
+    Por isso todo campo de texto livre aqui (contratante, logradouro,
+    bairro) usa um "lookahead" com a lista de próximos rótulos conhecidos
+    (nunca um único rótulo fixo como "Complemento:") — pára no PRIMEIRO
+    desses rótulos que aparecer, então nunca "atravessa" um campo inteiro
+    não relacionado só porque o rótulo esperado ficou longe demais no
+    texto extraído do PDF. Se nenhum rótulo conhecido aparecer depois, o
+    campo simplesmente não é preenchido — nunca inventa um corte no meio
+    do texto."""
     dados = {}
     t = _normalizar(texto)
-    m = re.search(r"Contratante:\s*([A-ZÀ-Ú \.]+?)\s*CPF/CNPJ", t)
+
+    # Nome do contratante — aceita CAIXA ALTA (CREA-MT) ou Title Case
+    # (CREA-GO); pára no primeiro rótulo conhecido que vier depois, nunca
+    # tenta adivinhar um corte se nenhum desses aparecer.
+    m = re.search(
+        r"Contratante:\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\.]*?)\s*"
+        r"(?=CPF/CNPJ|Data\s+de\s+In[íi]cio|C[óo]digo:|Proprietário|\d\.\s)",
+        t,
+    )
     if m:
         dados["titular"] = m.group(1).strip().title()
     m = re.search(r"CPF/CNPJ:\s*([\d\.\-/]+)", t)
     if m:
         dados["cpf_cnpj"] = re.sub(r"\D", "", m.group(1))
-    m = re.search(r"Rua:\s*(.+?)\s*Complemento:", t)
+
+    # Logradouro — duas variantes, testadas contra as duas ARTs reais:
+    # 1) rótulo "Rua:" explícito (CREA-MT) — pára no primeiro rótulo de
+    #    endereço conhecido que vier depois (nunca no "Complemento:" mais
+    #    distante do documento, que foi o bug original).
+    m = re.search(
+        r"Rua:\s*([A-Za-zÀ-ÿ0-9°º\s\.\-]+?)\s*"
+        r"(?=Cidade:|Bairro:|Complemento:|N[úu]mero:)",
+        t,
+    )
     if m:
         dados["logradouro"] = m.group(1).strip().title()
-    m = re.search(r"Cidade:\s*([A-ZÀ-Ú]+)\s*UF:\s*([A-Z]{2})", t)
+    else:
+        # 2) sem rótulo "Rua:" (CREA-GO) — o logradouro vem solto, logo
+        #    depois do CPF/CNPJ do contratante, terminando em ", Nº ...
+        #    Bairro:".
+        m = re.search(
+            r"CPF/CNPJ:\s*[\d\.\-/]+\s*([A-Za-zÀ-ÿ0-9°º\s\.]+?)\s*,\s*"
+            r"N[ºo°]\s*\S+\s*Bairro:",
+            t,
+        )
+        if m:
+            dados["logradouro"] = m.group(1).strip().title()
+
+    # Bairro — mesma lógica do logradouro: pára no primeiro rótulo
+    # conhecido, nunca faz a captura "andar" até um "CEP:"/"Rua:"/"Cidade:"
+    # distante demais.
+    m = re.search(
+        r"Bairro:\s*([A-Za-zÀ-ÿ0-9°º\s\.\-]+?)\s*"
+        r"(?=CEP:|Rua:|Cidade:|N[úu]mero:|Complemento:)",
+        t,
+    )
+    if m:
+        dados["bairro"] = m.group(1).strip().title()
+
+    # Cidade/UF — "Cidade: X UF: Y" (CREA-MT, cidade pode ter espaço, ex.:
+    # "BARRA DO GARÇAS") ou "Cidade: X-UF" junto, sem rótulo "UF:" à parte
+    # (CREA-GO, ex.: "ARAGARÇAS-GO").
+    m = re.search(r"Cidade:\s*([A-ZÀ-Ú][A-ZÀ-Ú\s]*?)\s*UF:\s*([A-Z]{2})\b", t)
     if m:
         dados["cidade"] = m.group(1).strip().title()
         dados["uf"] = m.group(2).strip()
+    else:
+        m = re.search(r"Cidade:\s*([A-ZÀ-Ú][A-ZÀ-Ú\s]*?)-([A-Z]{2})\b", t)
+        if m:
+            dados["cidade"] = m.group(1).strip().title()
+            dados["uf"] = m.group(2).strip()
+
     m = re.search(r"CEP:\s*([\d\.\-]+)", t)
     if m:
         dados["cep"] = re.sub(r"\D", "", m.group(1))
-    m = re.search(r"([\d,]+)\s*quilowatt", t)
+    # "quilowatt(s)" — CREA-MT usa minúsculo/singular, CREA-GO usa
+    # "QUILOWATTS" maiúsculo/plural; aceita os dois.
+    m = re.search(r"([\d,\.]+)\s*quilowatts?", t, re.IGNORECASE)
     if m:
         try:
             dados["potencia_instalada_kw"] = float(m.group(1).replace(",", "."))
@@ -848,11 +924,38 @@ CAMPOS_TIPO = {
 }
 
 
-def extrair_campos_arquivo(texto: str, tipo: str) -> dict:
+# Extratores que só podem confiar no "cartão de contato" — o Google Doc
+# solto (coordenadas + e-mail + celular, cada um em seu próprio parágrafo)
+# que o usuário confirmou que SEMPRE está na pasta do cliente e que deve
+# ser a ÚNICA fonte de localização/e-mail/telefone. Rodar esses dois
+# extratores sobre QUALQUER outro documento é sempre arriscado: eles não
+# têm rótulo nenhum pra se guiar (são "soltos" de propósito, pra reconhecer
+# o formato do cartão de contato), então pegam o primeiro e-mail/número que
+# aparecer no texto — e documentos legítimos e necessários pra outros
+# campos, como a própria ART, costumam ter um e-mail institucional no
+# rodapé (ex.: "atendimento@creago.org.br", do CREA-GO) que não é o do
+# cliente. Isso já causou dois bugs reais nesta conversa: primeiro com
+# e-mail de fabricante de equipamento (resolvido restringindo os
+# documentos de fabricante — ver `eh_documento_fabricante_equipamento`),
+# depois com o e-mail institucional do próprio CREA-GO vindo da ART.
+# Restringir esses dois extratores só ao cartão de contato resolve a
+# causa raiz de vez, em vez de ficar bloqueando um domínio de e-mail
+# problemático por vez.
+EXTRATORES_SO_CARTAO_CONTATO = (extrair_contato_livre, extrair_coordenadas_livres)
+
+
+def extrair_campos_arquivo(texto: str, tipo: str, eh_cartao_contato: bool = False) -> dict:
     """Roda todos os extratores relevantes pro tipo de projeto sobre o
-    texto de UM arquivo e devolve um dict só com o que foi reconhecido."""
+    texto de UM arquivo e devolve um dict só com o que foi reconhecido.
+    `eh_cartao_contato` deve ser True só pro Google Doc de contato do
+    cliente — nesse (e só nesse) arquivo os extratores soltos de
+    e-mail/celular/coordenadas rodam; em qualquer outro arquivo (mesmo a
+    ART, mesmo a conta de energia) eles ficam de fora, pra nunca pegar um
+    e-mail/telefone que não seja o do cliente."""
     resultado = {}
     for extrator in CAMPOS_TIPO.get(tipo, ()):
+        if extrator in EXTRATORES_SO_CARTAO_CONTATO and not eh_cartao_contato:
+            continue
         try:
             achado = extrator(texto)
         except Exception:
@@ -1293,9 +1396,15 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
         # endereço/contato/genérico NEM RODAM sobre esse texto. A extração
         # de equipamentos (logo abaixo) continua normal.
         eh_fabricante = eh_documento_fabricante_equipamento(texto)
+        # "Cartão de contato" do cliente — o único arquivo de onde
+        # e-mail/celular/coordenadas soltos podem vir (ver
+        # `EXTRATORES_SO_CARTAO_CONTATO`). Identificado pelo tipo do
+        # arquivo (Google Doc), não pelo conteúdo: é assim que esse
+        # arquivo sempre chega na pasta do cliente.
+        eh_cartao_contato = arquivo["mimeType"] == "application/vnd.google-apps.document"
         tag_fonte = " (fabricante do equipamento — não usado p/ endereço/contato)" if eh_fabricante else ""
         resultado.arquivos_lidos.append(f"{nome} (OCR){tag_fonte}" if via_ocr else f"{nome}{tag_fonte}")
-        achados = {} if eh_fabricante else extrair_campos_arquivo(texto, tipo)
+        achados = {} if eh_fabricante else extrair_campos_arquivo(texto, tipo, eh_cartao_contato)
         for campo, valor in achados.items():
             if campo not in resultado.campos:
                 resultado.campos[campo] = valor
