@@ -449,6 +449,14 @@ def _sem_duplicatas(linhas: list) -> list:
     return resultado
 
 
+# Área média de uma placa fotovoltaica residencial/comercial — usada como
+# estimativa da área total ocupada pelos painéis (m²) nos documentos
+# gerados. Não é a medida exata de nenhum modelo específico (varia por
+# fabricante), é uma média de mercado que o escritório usa consistentemente
+# pra esse campo (confirmado pelo usuário): área total = quantidade × 2.
+AREA_M2_POR_PLACA = 2
+
+
 def extrair_equipamentos_pedido(texto: str) -> dict:
     """Quantidade e potência de módulos/inversores num 'Pedido' de kit
     solar (ex.: Solfácil) — ex.: "15x MODULO BIFACIAL 600W ... Disponível"
@@ -473,7 +481,7 @@ def extrair_equipamentos_pedido(texto: str) -> dict:
     ):
         qtd, watts = int(m.group(1)), int(m.group(2))
         paineis.append({"quantidade": qtd, "fabricante": "", "modelo": "",
-                         "area_m2": 0, "potencia_kw": round(watts / 1000, 3)})
+                         "area_m2": qtd * AREA_M2_POR_PLACA, "potencia_kw": round(watts / 1000, 3)})
     for m in re.finditer(
         r"(\d+)\s*x\s*INVERSOR\b.*?(\d+(?:[.,]\d+)?)\s*KW\b.*?(\d{2,3})\s*V\b.*?Dispon[íi]vel",
         texto, re.IGNORECASE | re.DOTALL,
@@ -668,7 +676,7 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
             continue
         paineis.append({"quantidade": qtd, "fabricante": m.group(3).strip().upper(),
                          "modelo": m.group(4).strip().upper(),
-                         "area_m2": 0, "potencia_kw": round(watts_unit / 1000, 3)})
+                         "area_m2": qtd * AREA_M2_POR_PLACA, "potencia_kw": round(watts_unit / 1000, 3)})
 
     # --- frase-lista: "N Inversores marca M, [um] modelo D, potência pico AC P kW" ---
     for m in re.finditer(
@@ -724,7 +732,11 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
 
     def _valor_marca_modelo(pos_fim: int):
         janela = texto[pos_fim: pos_fim + 150]
-        m = re.search(r"([A-Za-zÀ-ÿ]{3,})\s*/\s*([\w][\w\-—–]{2,}?)(?=[\s.;,)]|$)", janela)
+        # O "~" entra na classe do modelo porque fabricantes usam faixa de
+        # potência no próprio nome do modelo (ex.: "HSM-ND66-GR600~625-Y"
+        # cobre de 600 a 625 Wp) — sem ele, esse "/Marca/Modelo:" inteiro
+        # não casava e o par saía em branco mesmo estando legível no texto.
+        m = re.search(r"([A-Za-zÀ-ÿ]{3,})\s*/\s*([\w][\w\-—–~]{2,}?)(?=[\s.;,)]|$)", janela)
         if not m:
             return None
         # Um modelo de equipamento real sempre tem letra E número juntos
@@ -763,11 +775,12 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
                 except ValueError:
                     watts_unit = None
                 if watts_unit:
+                    qtd_painel = int(m_qtd.group(1))
                     paineis.append({
-                        "quantidade": int(m_qtd.group(1)),
+                        "quantidade": qtd_painel,
                         "fabricante": mv.group(1).strip().upper(),
                         "modelo": mv.group(2).strip(" -—–").upper().replace("—", "-").replace("–", "-"),
-                        "area_m2": 0, "potencia_kw": round(watts_unit / 1000, 3),
+                        "area_m2": qtd_painel * AREA_M2_POR_PLACA, "potencia_kw": round(watts_unit / 1000, 3),
                     })
 
     # --- mesmo formato, mas OCR ruidoso e "Quantidade:" ilegível — usa a
@@ -791,7 +804,7 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
                 if abs(total_calculado - total_informado) <= max(0.05, total_informado * 0.02):
                     paineis.append({
                         "quantidade": qtd, "fabricante": fabricante, "modelo": modelo,
-                        "area_m2": 0, "potencia_kw": round(watts_unit / 1000, 3),
+                        "area_m2": qtd * AREA_M2_POR_PLACA, "potencia_kw": round(watts_unit / 1000, 3),
                     })
                     break
 
@@ -809,7 +822,7 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
             total_calculado = qtd * watts_unit / 1000
             if abs(total_calculado - total_informado) <= max(0.05, total_informado * 0.02):
                 paineis.append({"quantidade": qtd, "fabricante": "", "modelo": "",
-                                 "area_m2": 0, "potencia_kw": round(watts_unit / 1000, 3)})
+                                 "area_m2": qtd * AREA_M2_POR_PLACA, "potencia_kw": round(watts_unit / 1000, 3)})
 
     # --- mesmo carimbo numerado, versão SEM ruído de OCR — lê "Quantidade:"
     # e "Potencia:" direto dos rótulos do bloco do inversor (o último
@@ -1567,6 +1580,48 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
                     resultado.fonte_inversores = nome
             except Exception as exc:
                 resultado.erros.append(f"[erro ao reconhecer equipamentos de projeto executivo em {nome}: {exc}]")
+
+        # Completa marca/modelo a partir do Projeto Executivo/Diagrama
+        # Unifilar MESMO quando a lista de painéis/inversores já foi
+        # "ganha" por um arquivo anterior — tipicamente um pedido de kit de
+        # revendedor, que deixa marca/modelo em branco de propósito (ver
+        # `extrair_equipamentos_pedido`). Sem isso, o bloco acima nunca
+        # roda pra esse arquivo (ele só tenta quando `paineis`/`inversores`
+        # ainda estão vazios) e marca/modelo ficam em branco pra sempre,
+        # mesmo aparecendo certinho no Projeto Executivo. Só backfilla — só
+        # entra em campos ainda vazios, nunca troca quantidade/potência já
+        # confirmados pelo pedido — e só quando a quantidade de itens bate
+        # (mesmo número de linhas), pra não arriscar casar o equipamento
+        # errado com a marca/modelo de outro.
+        if resultado.paineis and any(not p.get("fabricante") for p in resultado.paineis):
+            try:
+                paineis_pe = extrair_equipamentos_projeto_executivo(texto)["paineis"]
+                if len(paineis_pe) == len(resultado.paineis):
+                    completou = False
+                    for painel, painel_pe in zip(resultado.paineis, paineis_pe):
+                        if not painel.get("fabricante") and painel_pe.get("fabricante"):
+                            painel["fabricante"] = painel_pe["fabricante"]
+                            painel["modelo"] = painel_pe["modelo"]
+                            completou = True
+                    if completou:
+                        resultado.fonte_paineis = f"{resultado.fonte_paineis} (marca/modelo: {nome})"
+            except Exception as exc:
+                resultado.erros.append(f"[erro ao completar marca/modelo de painéis em {nome}: {exc}]")
+
+        if resultado.inversores and any(not inv.get("fabricante") for inv in resultado.inversores):
+            try:
+                inversores_pe = extrair_equipamentos_projeto_executivo(texto)["inversores"]
+                if len(inversores_pe) == len(resultado.inversores):
+                    completou = False
+                    for inv, inv_pe in zip(resultado.inversores, inversores_pe):
+                        if not inv.get("fabricante") and inv_pe.get("fabricante"):
+                            inv["fabricante"] = inv_pe["fabricante"]
+                            inv["modelo"] = inv_pe["modelo"]
+                            completou = True
+                    if completou:
+                        resultado.fonte_inversores = f"{resultado.fonte_inversores} (marca/modelo: {nome})"
+            except Exception as exc:
+                resultado.erros.append(f"[erro ao completar marca/modelo de inversores em {nome}: {exc}]")
 
         # Print de mapa/satélite colado no Diagrama Unifilar — reaproveita
         # pra pré-preencher a "foto de localização" do Memorial Descritivo,
