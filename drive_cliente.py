@@ -619,6 +619,62 @@ def extrair_projeto_executivo(texto: str) -> dict:
     return dados
 
 
+def _marcas_modelos_projeto_executivo(texto: str) -> dict:
+    """Só marca/modelo (nunca quantidade/potência) de módulo e inversor, a
+    partir do mesmo carimbo "NN — Marca/Modelo:" do Projeto Executivo/
+    Diagrama Unifilar que `extrair_equipamentos_projeto_executivo` usa —
+    criada especificamente pra COMPLETAR (backfill) marca/modelo numa lista
+    de equipamentos cuja quantidade/potência já vieram de outro documento
+    confiável (o pedido de kit do revendedor, que deixa esses dois campos
+    sempre em branco de propósito — ver `levantamento_pasta`).
+
+    Confirmado com um Projeto Executivo real nesta conversa (cliente Douglas
+    Vieira Dos Santos): o OCR de uma prancha CAD grande pode inserir texto
+    de uma coluna vizinha bem no meio do carimbo do MÓDULO — o "01 —" some
+    de perto do "Marca/Modelo:" dele e esse par vira inencontrável por
+    completo —, enquanto o carimbo do INVERSOR, mais isolado na folha, sai
+    inteiro e legível. Mesmo nesse caso ruim, `extrair_equipamentos_
+    projeto_executivo` falhava pros dois (módulo E inversor) porque ela só
+    reconhece o inversor quando sobra MAIS DE UM candidato "NN — Marca/
+    Modelo:" no texto inteiro (pra distinguir do carimbo do módulo) — aqui
+    sobra só um (o do inversor), e o restante da função também exige
+    conseguir ler quantidade/potência junto, dois valores que o mesmo OCR
+    lê errado com frequência (ex.: "1" virando "|"). Esta função relaxa as
+    DUAS exigências: aceita um único candidato sozinho, e nunca pede
+    quantidade/potência — só decide se o candidato é de módulo ou de
+    inversor pelo rótulo mais próximo depois dele ("Tipo: Mono/Bi/
+    Trifásico" é exclusivo do inversor; "Potência nominal:"/"Eficiência:"
+    só aparece no bloco do módulo), com a janela de contexto sempre travada
+    no PRÓXIMO candidato (nunca lê rótulo do equipamento seguinte por
+    engano). Quando nenhum rótulo de contexto aparece (ruído de OCR
+    grande), o candidato fica de fora — nunca advinha o tipo."""
+    resultado = {"modulo": None, "inversor": None}
+    candidatos = list(re.finditer(
+        r"[O0]?\d{1,2}\s*[-—–]\s*Marca\s*/?\s*Modelo\s*:\s*", texto, re.IGNORECASE
+    ))
+    for indice, cand in enumerate(candidatos):
+        janela_valor = texto[cand.end(): cand.end() + 150]
+        m = re.search(r"([A-Za-zÀ-ÿ]{3,})\s*/\s*([\w][\w\-—–~]{2,}?)(?=[\s.;,)]|$)", janela_valor)
+        if not m:
+            continue
+        modelo = m.group(2)
+        if not (re.search(r"[A-Za-z]", modelo) and re.search(r"\d", modelo)):
+            continue
+        fabricante = m.group(1).strip().upper()
+        modelo = modelo.strip(" -—–").upper().replace("—", "-").replace("–", "-")
+        fim_contexto = candidatos[indice + 1].start() if indice + 1 < len(candidatos) else cand.end() + 250
+        janela_contexto = texto[cand.end(): fim_contexto]
+        if resultado["inversor"] is None and re.search(
+            r"Tipo\s*[:\-]?\s*(Mono|Bi|Tri)f[áa]sic[oa]", janela_contexto, re.IGNORECASE
+        ):
+            resultado["inversor"] = {"fabricante": fabricante, "modelo": modelo}
+        elif resultado["modulo"] is None and re.search(
+            r"(Pot[êeé]ncia\s*nominal|Efici[êe]ncia)\s*[:\-]?", janela_contexto, re.IGNORECASE
+        ):
+            resultado["modulo"] = {"fabricante": fabricante, "modelo": modelo}
+    return resultado
+
+
 def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
     """Quantidade, potência e — só para este tipo de documento, por
     decisão explícita do usuário — marca/modelo de módulos/inversores a
@@ -1585,41 +1641,67 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
         # Unifilar MESMO quando a lista de painéis/inversores já foi
         # "ganha" por um arquivo anterior — tipicamente um pedido de kit de
         # revendedor, que deixa marca/modelo em branco de propósito (ver
-        # `extrair_equipamentos_pedido`). Sem isso, o bloco acima nunca
-        # roda pra esse arquivo (ele só tenta quando `paineis`/`inversores`
+        # `extrair_equipamentos_pedido`). Sem isso, o bloco de cima nunca
+        # roda pra esse arquivo (só tenta quando `paineis`/`inversores`
         # ainda estão vazios) e marca/modelo ficam em branco pra sempre,
         # mesmo aparecendo certinho no Projeto Executivo. Só backfilla — só
         # entra em campos ainda vazios, nunca troca quantidade/potência já
-        # confirmados pelo pedido — e só quando a quantidade de itens bate
-        # (mesmo número de linhas), pra não arriscar casar o equipamento
-        # errado com a marca/modelo de outro.
+        # confirmados pelo pedido.
+        #
+        # Duas estratégias, da mais tolerante pra mais estrita:
+        #   1) `_marcas_modelos_projeto_executivo` — não exige confirmar
+        #      quantidade/potência (só o rótulo de contexto certo), então
+        #      sobrevive a OCR ruim o bastante pra perder esses dois
+        #      números mas ainda deixar marca/modelo legíveis. Só serve
+        #      quando a lista já tem exatamente 1 painel/1 inversor (caso
+        #      comum residencial) — com 1 item não tem ambiguidade de qual
+        #      linha completar.
+        #   2) `extrair_equipamentos_projeto_executivo` casada posição a
+        #      posição — cobre o caso de vários modelos diferentes (comum
+        #      em projeto comercial maior), mas só backfilla quando o
+        #      número de linhas bate exatamente nos dois documentos, pra
+        #      não arriscar casar o equipamento errado.
         if resultado.paineis and any(not p.get("fabricante") for p in resultado.paineis):
             try:
-                paineis_pe = extrair_equipamentos_projeto_executivo(texto)["paineis"]
-                if len(paineis_pe) == len(resultado.paineis):
-                    completou = False
-                    for painel, painel_pe in zip(resultado.paineis, paineis_pe):
-                        if not painel.get("fabricante") and painel_pe.get("fabricante"):
-                            painel["fabricante"] = painel_pe["fabricante"]
-                            painel["modelo"] = painel_pe["modelo"]
-                            completou = True
-                    if completou:
-                        resultado.fonte_paineis = f"{resultado.fonte_paineis} (marca/modelo: {nome})"
+                completou = False
+                if len(resultado.paineis) == 1 and not resultado.paineis[0].get("fabricante"):
+                    modulo = _marcas_modelos_projeto_executivo(texto)["modulo"]
+                    if modulo:
+                        resultado.paineis[0]["fabricante"] = modulo["fabricante"]
+                        resultado.paineis[0]["modelo"] = modulo["modelo"]
+                        completou = True
+                if not completou:
+                    paineis_pe = extrair_equipamentos_projeto_executivo(texto)["paineis"]
+                    if len(paineis_pe) == len(resultado.paineis):
+                        for painel, painel_pe in zip(resultado.paineis, paineis_pe):
+                            if not painel.get("fabricante") and painel_pe.get("fabricante"):
+                                painel["fabricante"] = painel_pe["fabricante"]
+                                painel["modelo"] = painel_pe["modelo"]
+                                completou = True
+                if completou:
+                    resultado.fonte_paineis = f"{resultado.fonte_paineis} (marca/modelo: {nome})"
             except Exception as exc:
                 resultado.erros.append(f"[erro ao completar marca/modelo de painéis em {nome}: {exc}]")
 
         if resultado.inversores and any(not inv.get("fabricante") for inv in resultado.inversores):
             try:
-                inversores_pe = extrair_equipamentos_projeto_executivo(texto)["inversores"]
-                if len(inversores_pe) == len(resultado.inversores):
-                    completou = False
-                    for inv, inv_pe in zip(resultado.inversores, inversores_pe):
-                        if not inv.get("fabricante") and inv_pe.get("fabricante"):
-                            inv["fabricante"] = inv_pe["fabricante"]
-                            inv["modelo"] = inv_pe["modelo"]
-                            completou = True
-                    if completou:
-                        resultado.fonte_inversores = f"{resultado.fonte_inversores} (marca/modelo: {nome})"
+                completou = False
+                if len(resultado.inversores) == 1 and not resultado.inversores[0].get("fabricante"):
+                    inversor = _marcas_modelos_projeto_executivo(texto)["inversor"]
+                    if inversor:
+                        resultado.inversores[0]["fabricante"] = inversor["fabricante"]
+                        resultado.inversores[0]["modelo"] = inversor["modelo"]
+                        completou = True
+                if not completou:
+                    inversores_pe = extrair_equipamentos_projeto_executivo(texto)["inversores"]
+                    if len(inversores_pe) == len(resultado.inversores):
+                        for inv, inv_pe in zip(resultado.inversores, inversores_pe):
+                            if not inv.get("fabricante") and inv_pe.get("fabricante"):
+                                inv["fabricante"] = inv_pe["fabricante"]
+                                inv["modelo"] = inv_pe["modelo"]
+                                completou = True
+                if completou:
+                    resultado.fonte_inversores = f"{resultado.fonte_inversores} (marca/modelo: {nome})"
             except Exception as exc:
                 resultado.erros.append(f"[erro ao completar marca/modelo de inversores em {nome}: {exc}]")
 
