@@ -1005,6 +1005,28 @@ def gerar_energisa(dados):
             with open(pdf_final, "wb") as f:
                 writer.write(f)
 
+        with st.spinner("Gerando Formulário de Cargas (documento separado)..."):
+            # O WSGPE exige esse anexo como arquivo PRÓPRIO (campo "Levantamento
+            # de Carga/Demanda"), mesmo o conteúdo já estando dentro do PDF final
+            # combinado acima — por isso ele também sai como um PDF independente,
+            # gerado do mesmo jeito (restringindo a impressão só a essa aba, sem
+            # passar pelo openpyxl) pra não correr risco de ficar divergente do
+            # restante do documento.
+            carga_print_path = tmp / f"{nome_base}_carga_print.xlsm"
+            _shutil.copyfile(str(xlsm_path), str(carga_print_path))
+            restringir_impressao_para_pdf(str(carga_print_path), ["RELACAO DE CARGA"])
+
+            run_soffice(["--headless", "--convert-to", "pdf", "--outdir", str(tmp), str(carga_print_path)])
+            gerado_carga_pdf = carga_print_path.with_suffix(".pdf")
+            reader_carga = PdfReader(str(gerado_carga_pdf))
+            writer_carga = PdfWriter()
+            for page in reader_carga.pages:
+                if page.extract_text().strip():
+                    writer_carga.add_page(page)
+            carga_path = tmp / f"{nome_base}_Formulario_de_Cargas.pdf"
+            with open(carga_path, "wb") as f:
+                writer_carga.write(f)
+
         with st.spinner("Gerando arquivo para ANEEL..."):
             import openpyxl
             wb2 = openpyxl.load_workbook(str(xlsm_path), data_only=True)
@@ -1029,6 +1051,7 @@ def gerar_energisa(dados):
             "xlsm_bytes": xlsm_path.read_bytes(), "xlsm_nome": xlsm_path.name,
             "pdf_bytes": pdf_final.read_bytes(), "pdf_nome": pdf_final.name,
             "aneel_bytes": aneel_path.read_bytes(), "aneel_nome": aneel_path.name,
+            "carga_bytes": carga_path.read_bytes(), "carga_nome": carga_path.name,
         }
 
     mostrar_downloads_energisa()
@@ -1039,6 +1062,16 @@ def mostrar_downloads_energisa():
     if not saida:
         return
     st.success("Documentos gerados!")
+
+    # Destacado à parte dos demais: é o único anexo que o WSGPE sempre pede
+    # como arquivo próprio (campo "Levantamento de Carga/Demanda"), mesmo
+    # com o mesmo conteúdo já presente no PDF final combinado abaixo.
+    st.info("📋 **Formulário de Cargas** — baixe este arquivo à parte para anexar no campo "
+            "\"Levantamento de Carga/Demanda\" do WSGPE.")
+    st.download_button("⬇️ Formulário de Cargas (documento separado)", saida["carga_bytes"],
+                        saida["carga_nome"], key="dl_carga_energisa", type="primary")
+
+    st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
     c1.download_button("⬇️ Planilha (.xlsm)", saida["xlsm_bytes"], saida["xlsm_nome"], key="dl_xlsm_energisa")
     c2.download_button("⬇️ PDF final", saida["pdf_bytes"], saida["pdf_nome"], key="dl_pdf_energisa")
@@ -1047,6 +1080,7 @@ def mostrar_downloads_energisa():
         (saida["xlsm_nome"], saida["xlsm_bytes"]),
         (saida["pdf_nome"], saida["pdf_bytes"]),
         (saida["aneel_nome"], saida["aneel_bytes"]),
+        (saida["carga_nome"], saida["carga_bytes"]),
     ])
     c4.download_button("📦 Baixar tudo (.zip)", zip_bytes, f"documentos_{saida['nome_base']}.zip",
                         key="dl_zip_energisa", type="primary")
