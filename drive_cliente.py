@@ -250,10 +250,17 @@ def extrair_dados_art(texto: str) -> dict:
         dados["cep"] = re.sub(r"\D", "", m.group(1))
     # "quilowatt(s)" — CREA-MT usa minúsculo/singular, CREA-GO usa
     # "QUILOWATTS" maiúsculo/plural; aceita os dois.
+    # IMPORTANTE: isso é a potência de microgeração declarada na ART (a do
+    # sistema solar/inversor), que é um conceito DIFERENTE de "Potência
+    # Instalada" do formulário — esse último é a classe de carga instalada
+    # da UC (NDU-001/NT.00001.EQTL-09), definida pelo disjuntor de entrada,
+    # e não tem relação com a potência de geração. Guarda só como
+    # informação de referência (potencia_geracao_kw), NUNCA como
+    # potencia_instalada_kw — ver rules-and-conventions sobre esse bug.
     m = re.search(r"([\d,\.]+)\s*quilowatts?", t, re.IGNORECASE)
     if m:
         try:
-            dados["potencia_instalada_kw"] = float(m.group(1).replace(",", "."))
+            dados["potencia_geracao_kw"] = float(m.group(1).replace(",", "."))
         except ValueError:
             pass
     coord, achados = extrair_coordenadas(t)
@@ -601,18 +608,22 @@ def extrair_projeto_executivo(texto: str) -> dict:
         if len(digitos) in (11, 14) and "cpf_cnpj" not in dados:
             dados["cpf_cnpj"] = digitos
 
-    # "POTÊNCIA TOTAL INSTALADA/INVERSORES" é a potência que a
-    # concessionária efetivamente aprova (a do inversor, não a dos
-    # módulos) — é esse número que corresponde ao campo "Potência
-    # Instalada" do formulário. Só usa o "POTÊNCIA:" mais genérico do
-    # carimbo se o rótulo específico não aparecer.
+    # "POTÊNCIA TOTAL INSTALADA/INVERSORES" é a potência nominal dos
+    # inversores (potência de geração), NÃO o campo "Potência Instalada"
+    # do formulário — esse é a classe de carga instalada da UC, definida
+    # pelo disjuntor de entrada (NDU-001 Tabela 16/17/18, NT.00001.EQTL-09),
+    # sem relação com a potência de geração solar. Guarda só como
+    # informação de referência (potencia_geracao_kw); quem preenche
+    # "Potência Instalada" de verdade é o campo manual do formulário
+    # (que já usa a soma da Relação de Carga como padrão) — ver
+    # rules-and-conventions sobre esse bug.
     m = (
         re.search(r"POT[ÊE]NCIA\s+TOTAL\s+INSTALADA\s*/\s*INVERSORES\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*kWp?", texto, re.IGNORECASE)
         or re.search(r"\bPOT[ÊE]NCIA\s*[:\-]\s*(\d+(?:[.,]\d+)?)\s*kW\b", texto, re.IGNORECASE)
     )
-    if m and "potencia_instalada_kw" not in dados:
+    if m and "potencia_geracao_kw" not in dados:
         try:
-            dados["potencia_instalada_kw"] = float(m.group(1).replace(",", "."))
+            dados["potencia_geracao_kw"] = float(m.group(1).replace(",", "."))
         except ValueError:
             pass
 
@@ -940,16 +951,43 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
                     })
 
     # --- inversor por rótulos separados (reforço, só se nada acima achou) ---
+    # IMPORTANTE (bug já reportado em produção: inversor saindo com a MESMA
+    # quantidade dos módulos): "Tensão de saída" é o único rótulo deste
+    # bloco que é exclusivo de inversor — "Quantidade:"/"Potência:" também
+    # aparecem no bloco de especificação dos MÓDULOS, em outro trecho do
+    # mesmo documento. Por isso a busca NÃO pode rodar sobre `texto`
+    # inteiro (pegaria a quantidade/potência do módulo por engano, se
+    # aparecer antes no documento) — tem que ficar restrita a uma janela
+    # ao redor do "Tensão de saída" encontrado, que é o único ponto de
+    # ancoragem realmente específico do inversor.
     if not inversores:
-        m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", texto, re.IGNORECASE)
-        m_pot = re.search(r"Pot[êeé]ncia(?:\s*Nominal)?(?:\s*CA)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*k?W\b", texto, re.IGNORECASE)
         m_tensao = re.search(r"Tens[ãa]o\s*de\s*sa[íi]da\s*[:\-]?\s*(\d{2,3})\s*V\b", texto, re.IGNORECASE)
-        m_fab = re.search(r"FABRICANTE\s*[:\-]?\s*([A-ZÀ-Ú][\w\-]*)", texto, re.IGNORECASE)
+        _janela = ""
+        if m_tensao:
+            # Limite de 400 caracteres pra trás é insuficiente sozinho: num
+            # documento real, a "Quantidade:"/"Potência:" do bloco de
+            # MÓDULOS pode estar bem perto (poucas linhas) do início do
+            # bloco do INVERSOR. Por isso o início da janela não recua um
+            # número fixo de caracteres — recua até o cabeçalho de seção
+            # "INVERSOR" mais próximo ANTES da "Tensão de saída" (se
+            # existir dentro de uma distância razoável), que é a fronteira
+            # real entre os dois blocos. Sem esse cabeçalho por perto, cai
+            # de volta pro limite fixo de 400 (mais restritivo que rodar
+            # sobre o documento inteiro, mas sem alucinar uma fronteira).
+            _limite_fixo = max(0, m_tensao.start() - 400)
+            _ini = _limite_fixo
+            for _m_sec in re.finditer(r"\bINVERSOR(?:ES)?\b", texto[_limite_fixo:m_tensao.start()], re.IGNORECASE):
+                _ini = _limite_fixo + _m_sec.start()
+            _fim = min(len(texto), m_tensao.end() + 400)
+            _janela = texto[_ini:_fim]
+        m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", _janela, re.IGNORECASE)
+        m_pot = re.search(r"Pot[êeé]ncia(?:\s*Nominal)?(?:\s*CA)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*k?W\b", _janela, re.IGNORECASE)
+        m_fab = re.search(r"FABRICANTE\s*[:\-]?\s*([A-ZÀ-Ú][\w\-]*)", _janela, re.IGNORECASE)
         # (?<!Marca/) evita casar o "Modelo:" que faz parte do rótulo
         # combinado "Marca/Modelo:" tratado nos blocos acima — aqui o
         # rótulo tem que ser "MODELO:" sozinho, senão o fabricante do
         # módulo pode vazar pra dentro do inversor por engano.
-        m_mod = re.search(r"(?<!Marca/)(?<!Marca /)\bMODELO\s*[:\-]?\s*([A-Za-z0-9][\w\-\.]*)", texto, re.IGNORECASE)
+        m_mod = re.search(r"(?<!Marca/)(?<!Marca /)\bMODELO\s*[:\-]?\s*([A-Za-z0-9][\w\-\.]*)", _janela, re.IGNORECASE)
         if m_qtd and m_pot and m_tensao:
             potencia = float(m_pot.group(1).replace(",", "."))
             if potencia > 100:  # veio em W, não kW (ex.: "POTÊNCIA NOMINAL CA: 5000")
@@ -1171,9 +1209,20 @@ def listar_arquivos_pasta(servico, pasta_id: str, _profundidade: int = 0, _total
         _total = []
     if _profundidade > MAX_PROFUNDIDADE or len(_total) >= MAX_ARQUIVOS:
         return _total
+    # IMPORTANTE (bug já reportado em produção: documento antigo/desatualizado
+    # sendo lido em vez da última versão enviada pelo cliente): a API do
+    # Drive NÃO garante nenhuma ordem específica em "files().list()" — sem
+    # orderBy, a ordem é efetivamente arbitrária. Como `levantamento_pasta`
+    # usa a regra "o primeiro arquivo que preencher um campo vence" (nunca
+    # sobrescreve um campo já preenchido por um arquivo processado antes),
+    # numa pasta com mais de um arquivo do mesmo tipo (ex.: duas ARTs, dois
+    # projetos executivos — cliente reenviou corrigido) a ordem de leitura é
+    # decisiva pra pegar os dados certos. Por isso pede modifiedTime e ordena
+    # do mais recente pro mais antigo, tanto na API quanto no merge final.
     resp = servico.files().list(
         q=f"'{pasta_id}' in parents and trashed = false",
-        fields="files(id, name, mimeType)",
+        fields="files(id, name, mimeType, modifiedTime)",
+        orderBy="modifiedTime desc",
         pageSize=100,
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
@@ -1185,6 +1234,12 @@ def listar_arquivos_pasta(servico, pasta_id: str, _profundidade: int = 0, _total
             listar_arquivos_pasta(servico, item["id"], _profundidade + 1, _total)
         else:
             _total.append(item)
+    if _profundidade == 0:
+        # Reordena o total combinado (pode ter vindo de subpastas, cada uma
+        # já ordenada individualmente, mas não entre si) pra garantir que o
+        # arquivo modificado mais recentemente, de QUALQUER subpasta, seja
+        # sempre processado primeiro por `levantamento_pasta`.
+        _total.sort(key=lambda i: i.get("modifiedTime") or "", reverse=True)
     return _total
 
 
@@ -1589,12 +1644,18 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
         # arquivo sempre chega na pasta do cliente.
         eh_cartao_contato = arquivo["mimeType"] == "application/vnd.google-apps.document"
         tag_fonte = " (fabricante do equipamento — não usado p/ endereço/contato)" if eh_fabricante else ""
-        resultado.arquivos_lidos.append(f"{nome} (OCR){tag_fonte}" if via_ocr else f"{nome}{tag_fonte}")
+        # Mostra a data de modificação do arquivo junto do nome, pra ficar
+        # claro pro usuário qual VERSÃO exata foi lida — importante agora
+        # que a ordenação por modifiedTime decide qual arquivo "ganha" num
+        # campo quando a pasta tem mais de um documento do mesmo tipo.
+        _mod = arquivo.get("modifiedTime", "")
+        nome_com_data = f"{nome} (mod. {_mod[:10]})" if _mod else nome
+        resultado.arquivos_lidos.append(f"{nome_com_data} (OCR){tag_fonte}" if via_ocr else f"{nome_com_data}{tag_fonte}")
         achados = {} if eh_fabricante else extrair_campos_arquivo(texto, tipo, eh_cartao_contato)
         for campo, valor in achados.items():
             if campo not in resultado.campos:
                 resultado.campos[campo] = valor
-                resultado.fontes[campo] = f"{nome} (OCR — confira com atenção redobrada)" if via_ocr else nome
+                resultado.fontes[campo] = f"{nome_com_data} (OCR — confira com atenção redobrada)" if via_ocr else nome_com_data
 
         # As duas extrações de equipamento abaixo, ao contrário de
         # `extrair_campos_arquivo` (que já protege cada extrator
