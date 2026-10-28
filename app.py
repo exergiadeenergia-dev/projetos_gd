@@ -623,7 +623,6 @@ def painel_busca_drive(tipo: str) -> dict:
 # ============================================================
 def form_energisa():
     st.header("Energisa-MT")
-    mostrar_downloads_energisa()
 
     defaults = painel_busca_drive("energisa")
     _versao_energisa = st.session_state.get("drive_versao_energisa", 0)
@@ -966,6 +965,26 @@ tensao_nominal_v: 220"""
             st.warning(f"⚠️ {aviso}")
         gerar_energisa(dados)
 
+    # Chamado uma única vez por execução do script, sempre no final — nunca
+    # dentro de `gerar_energisa` nem no topo da função (ver histórico: as
+    # duas chamadas na mesma execução, quando o botão "Gerar documentos" é
+    # clicado, geravam os mesmos `key=` de download_button duas vezes e
+    # derrubavam o app com StreamlitDuplicateElementKey). Fica depois do
+    # bloco do botão pra já refletir um levantamento que acabou de rodar
+    # nesta mesma execução, mas roda em toda execução (não só quando o
+    # botão é clicado) pra manter os downloads visíveis enquanto o usuário
+    # mexe em outros campos.
+    mostrar_downloads_energisa()
+
+    st.divider()
+    if st.button("🗑️ Limpar tudo e começar outro cliente (Energisa-MT)"):
+        for chave in list(st.session_state.keys()):
+            if chave == "saida_energisa" or (
+                chave.startswith("drive_") and chave.endswith("_energisa")
+            ) or "_energisa_v" in chave:
+                del st.session_state[chave]
+        st.rerun()
+
 
 def gerar_energisa(dados):
     nome_base = slug_arquivo(dados["cliente"]["titular"], dados["cliente"]["uc"])
@@ -1053,8 +1072,9 @@ def gerar_energisa(dados):
             "aneel_bytes": aneel_path.read_bytes(), "aneel_nome": aneel_path.name,
             "carga_bytes": carga_path.read_bytes(), "carga_nome": carga_path.name,
         }
-
-    mostrar_downloads_energisa()
+    # Não chama mostrar_downloads_energisa() aqui — quem mostra é
+    # form_energisa(), uma única vez por execução, depois que esta função
+    # retorna (ver comentário lá sobre o StreamlitDuplicateElementKey).
 
 
 def mostrar_downloads_energisa():
@@ -1091,7 +1111,6 @@ def mostrar_downloads_energisa():
 # ============================================================
 def form_equatorial():
     st.header("Equatorial-GO")
-    mostrar_downloads_equatorial()
 
     defaults = painel_busca_drive("equatorial")
     _versao_equatorial = st.session_state.get("drive_versao_equatorial", 0)
@@ -1231,6 +1250,11 @@ dht_corrente_pct: 3"""
             for aviso in avisos_campos_atencao(dados["cliente"], CAMPOS_ATENCAO_EQUATORIAL):
                 st.warning(f"⚠️ {aviso}")
             gerar_equatorial(dados, foto_go)
+        # Chamado uma única vez por execução, aqui no fim deste modo
+        # "texto colado" (que sempre retorna aqui embaixo) — nunca dentro
+        # de `gerar_equatorial` (ver comentário equivalente em
+        # form_energisa sobre o StreamlitDuplicateElementKey).
+        mostrar_downloads_equatorial()
         return
 
     st.divider()
@@ -1411,6 +1435,20 @@ dht_corrente_pct: 3"""
             st.warning(f"⚠️ {aviso}")
         gerar_equatorial(dados, foto, imagem_auto=_imagem_auto_go)
 
+    # Mesma lógica do form_energisa: chamado uma única vez por execução,
+    # sempre no final (nunca dentro de `gerar_equatorial`), pra não
+    # duplicar os `key=` dos botões de download e derrubar o app.
+    mostrar_downloads_equatorial()
+
+    st.divider()
+    if st.button("🗑️ Limpar tudo e começar outro cliente (Equatorial-GO)"):
+        for chave in list(st.session_state.keys()):
+            if chave == "saida_equatorial" or (
+                chave.startswith("drive_") and chave.endswith("_equatorial")
+            ) or "_equatorial_v" in chave:
+                del st.session_state[chave]
+        st.rerun()
+
 
 def gerar_equatorial(dados, foto_upload, imagem_auto: bytes | None = None):
     """`foto_upload` é o que o usuário subiu manualmente (widget do
@@ -1479,8 +1517,8 @@ def gerar_equatorial(dados, foto_upload, imagem_auto: bytes | None = None):
             "comiss_pdf_bytes": comiss_path.with_suffix(".pdf").read_bytes(),
             "comiss_pdf_nome": comiss_path.with_suffix(".pdf").name,
         }
-
-    mostrar_downloads_equatorial()
+    # Não chama mostrar_downloads_equatorial() aqui — quem mostra é
+    # form_equatorial(), uma única vez por execução (ver comentário lá).
 
 
 def mostrar_downloads_equatorial():
