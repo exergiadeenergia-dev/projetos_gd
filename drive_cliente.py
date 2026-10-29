@@ -1081,27 +1081,55 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
                     })
 
     # --- inversor por rótulos separados (reforço, só se nada acima achou) ---
+    # A "Quantidade:" tem que vir do BLOCO DO INVERSOR (janela logo depois
+    # do "FABRICANTE:" / "POTÊNCIA NOMINAL CA:"), nunca do primeiro
+    # "Quantidade:" do texto — esse costuma ser o do módulo (bug real:
+    # 14 painéis viravam 14 inversores). Sem "Quantidade:" no bloco do
+    # inversor, só assume 1 se a potência dele bater com a potência total
+    # do sistema; senão deixa a linha de fora (preenche à mão).
     if not inversores:
-        m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", texto, re.IGNORECASE)
-        m_pot = re.search(r"Pot[êeé]ncia(?:\s*Nominal)?(?:\s*CA)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*k?W\b", texto, re.IGNORECASE)
+        m_pot = re.search(r"Pot[êeé]ncia(?:\s*Nominal)?\s*CA\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*k?W\b", texto, re.IGNORECASE) \
+            or re.search(r"Pot[êeé]ncia(?:\s*Nominal)?(?:\s*CA)?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*k?W\b", texto, re.IGNORECASE)
         m_tensao = re.search(r"Tens[ãa]o\s*de\s*sa[íi]da\s*[:\-]?\s*(\d{2,3})\s*V\b", texto, re.IGNORECASE)
-        m_fab = re.search(r"FABRICANTE\s*[:\-]?\s*([A-ZÀ-Ú][\w\-]*)", texto, re.IGNORECASE)
-        # (?<!Marca/) evita casar o "Modelo:" que faz parte do rótulo
-        # combinado "Marca/Modelo:" tratado nos blocos acima — aqui o
-        # rótulo tem que ser "MODELO:" sozinho, senão o fabricante do
-        # módulo pode vazar pra dentro do inversor por engano.
-        m_mod = re.search(r"(?<!Marca/)(?<!Marca /)\bMODELO\s*[:\-]?\s*([A-Za-z0-9][\w\-\.]*)", texto, re.IGNORECASE)
-        if m_qtd and m_pot and m_tensao:
+        m_mod = None
+        m_fab = None
+        if m_pot and m_tensao:
+            # Bloco do INVERSOR = a partir do último "FABRICANTE:" que vem
+            # antes da potência CA (o do módulo fica pra trás).
+            pos_pot = min(m_pot.start(), m_tensao.start())
+            fabs = [m for m in re.finditer(r"FABRICANTE\s*[:\-]?\s*([A-ZÀ-Ú][\w\-]*)", texto, re.IGNORECASE) if m.start() <= pos_pot]
+            if fabs:
+                m_fab = fabs[-1]
+            ini_bloco = m_fab.start() if m_fab else max(0, pos_pot - 100)
+            fim_bloco = max(m_pot.end(), m_tensao.end()) + 100
+            bloco = texto[ini_bloco:fim_bloco]
+            # (?<!Marca/) evita casar o "Modelo:" do rótulo combinado
+            # "Marca/Modelo:" — aqui tem que ser "MODELO:" sozinho.
+            m_mod = re.search(r"(?<!Marca/)(?<!Marca /)\bMODELO\s*[:\-]?\s*([A-Za-z0-9][\w\-\.]*)", bloco, re.IGNORECASE)
             potencia = float(m_pot.group(1).replace(",", "."))
             if potencia > 100:  # veio em W, não kW (ex.: "POTÊNCIA NOMINAL CA: 5000")
                 potencia = round(potencia / 1000, 3)
-            inversores.append({
-                "quantidade": int(m_qtd.group(1)),
-                "fabricante": m_fab.group(1).strip().upper() if m_fab else "",
-                "modelo": m_mod.group(1).strip().upper() if m_mod else "",
-                "potencia_kw": potencia,
-                "tensao_nominal_v": m_tensao.group(1),
-            })
+            m_qtd = re.search(r"Quantidade\s*[:\-]?\s*(\d+)\b", bloco, re.IGNORECASE)
+            qtd_inv = int(m_qtd.group(1)) if m_qtd else None
+            # Mesma quantidade do módulo (>1) = quase certo que foi lida do
+            # bloco errado — descarta em vez de arriscar.
+            if qtd_inv and qtd_inv > 1 and any(p.get("quantidade") == qtd_inv for p in paineis):
+                qtd_inv = None
+            if qtd_inv is None:
+                m_total = re.search(r"Pot[êeé]ncia\s*Nominal\s*(?!CA)[:\-]?\s*(\d+(?:[.,]\d+)?)\s*kW", texto, re.IGNORECASE)
+                try:
+                    if m_total and abs(float(m_total.group(1).replace(",", ".")) - potencia) <= max(0.05, potencia * 0.02):
+                        qtd_inv = 1
+                except ValueError:
+                    pass
+            if qtd_inv:
+                inversores.append({
+                    "quantidade": qtd_inv,
+                    "fabricante": m_fab.group(1).strip().upper() if m_fab else "",
+                    "modelo": m_mod.group(1).strip().upper() if m_mod else "",
+                    "potencia_kw": potencia,
+                    "tensao_nominal_v": m_tensao.group(1),
+                })
 
     return {"paineis": _sem_duplicatas(paineis), "inversores": _sem_duplicatas(inversores)}
 
