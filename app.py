@@ -419,8 +419,22 @@ def _remapear_para_equatorial(campos: dict) -> dict:
     número — é "Endereço (rua, número, complemento)" tudo numa caixa só)."""
     campos = dict(campos)
     numero = campos.pop("numero", None)
-    if numero and campos.get("logradouro"):
-        campos["logradouro"] = f"{campos['logradouro']}, {numero}"
+    quadra = campos.pop("quadra", None)
+    lote = campos.pop("lote", None)
+    complemento = campos.pop("complemento", None)
+    if campos.get("logradouro"):
+        # Mesma ordem do padrão Equatorial-GO ("RUA X, Q. 00, L. 00, S/N"):
+        # quadra e lote da ART entram no endereço antes do número.
+        partes = [campos["logradouro"]]
+        if quadra:
+            partes.append(f"Q. {quadra}")
+        if lote:
+            partes.append(f"L. {lote}")
+        if numero:
+            partes.append("S/N" if str(numero).upper() in ("SN", "S/N") else str(numero))
+        if complemento:
+            partes.append(complemento)
+        campos["logradouro"] = ", ".join(partes)
     return {MAPA_CAMPOS_EQUATORIAL.get(c, c): v for c, v in campos.items()}
 
 

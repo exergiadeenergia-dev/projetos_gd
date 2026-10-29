@@ -235,15 +235,37 @@ def extrair_dados_art(texto: str) -> dict:
     # Cidade/UF — "Cidade: X UF: Y" (CREA-MT, cidade pode ter espaço, ex.:
     # "BARRA DO GARÇAS") ou "Cidade: X-UF" junto, sem rótulo "UF:" à parte
     # (CREA-GO, ex.: "ARAGARÇAS-GO").
-    m = re.search(r"Cidade:\s*([A-ZÀ-Ú][A-ZÀ-Ú\s]*?)\s*UF:\s*([A-Z]{2})\b", t)
+    # A cidade pode vir em CAIXA ALTA ("ARAGARÇAS-GO") OU em Title Case
+    # ("Aragarças-GO", caso real da ART da Renata Pereira — antes só a
+    # versão em caixa alta era reconhecida e Município/UF ficavam vazios).
+    # Só a sigla da UF continua exigindo maiúsculas.
+    m = re.search(r"Cidade:\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s]*?)\s*UF:\s*([A-Z]{2})\b", t)
     if m:
         dados["cidade"] = m.group(1).strip().title()
         dados["uf"] = m.group(2).strip()
     else:
-        m = re.search(r"Cidade:\s*([A-ZÀ-Ú][A-ZÀ-Ú\s]*?)-([A-Z]{2})\b", t)
+        m = re.search(r"Cidade:\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s]*?)\s*-\s*([A-Z]{2})\b", t)
         if m:
             dados["cidade"] = m.group(1).strip().title()
             dados["uf"] = m.group(2).strip()
+
+    # Quadra / Lote / Complemento — parte do endereço da ART que nunca era
+    # lida (o formulário saía com "Rua X, SN" sem quadra e lote). Pega a
+    # primeira ocorrência (seção "Dados do Contrato"; a seção da obra repete
+    # o mesmo endereço). O lookahead evita capturar o rótulo seguinte quando
+    # o campo vem vazio na ART (ex.: "Complemento: Cidade: ...").
+    m = re.search(r"Quadra:\s*(?!Lote:|Complemento:|Cidade:)(\S+)", t)
+    if m:
+        dados["quadra"] = m.group(1).strip().upper()
+    m = re.search(r"Lote:\s*(?!Quadra:|Complemento:|Cidade:)(\S+)", t)
+    if m:
+        dados["lote"] = m.group(1).strip().upper()
+    m = re.search(
+        r"Complemento:\s*(.*?)\s*(?=Cidade:|Data\s+de\s+In[íi]cio|E-?Mail:|Fone:|$)",
+        t,
+    )
+    if m and m.group(1).strip():
+        dados["complemento"] = m.group(1).strip().title()
 
     m = re.search(r"CEP:\s*([\d\.\-]+)", t)
     if m:
@@ -253,7 +275,7 @@ def extrair_dados_art(texto: str) -> dict:
     m = re.search(r"([\d,\.]+)\s*quilowatts?", t, re.IGNORECASE)
     if m:
         try:
-            dados["potencia_instalada_kw"] = float(m.group(1).replace(",", "."))
+            dados["potencia_geracao_kw"] = float(m.group(1).replace(",", "."))
         except ValueError:
             pass
     coord, achados = extrair_coordenadas(t)
@@ -610,9 +632,9 @@ def extrair_projeto_executivo(texto: str) -> dict:
         re.search(r"POT[ÊE]NCIA\s+TOTAL\s+INSTALADA\s*/\s*INVERSORES\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*kWp?", texto, re.IGNORECASE)
         or re.search(r"\bPOT[ÊE]NCIA\s*[:\-]\s*(\d+(?:[.,]\d+)?)\s*kW\b", texto, re.IGNORECASE)
     )
-    if m and "potencia_instalada_kw" not in dados:
+    if m and "potencia_geracao_kw" not in dados:
         try:
-            dados["potencia_instalada_kw"] = float(m.group(1).replace(",", "."))
+            dados["potencia_geracao_kw"] = float(m.group(1).replace(",", "."))
         except ValueError:
             pass
 
@@ -965,6 +987,24 @@ def extrair_equipamentos_projeto_executivo(texto: str) -> dict:
     return {"paineis": _sem_duplicatas(paineis), "inversores": _sem_duplicatas(inversores)}
 
 
+def eh_documento_gerado_pelo_sistema(texto: str, nome: str = "") -> bool:
+    """Detecta PDFs que o PRÓPRIO app gerou (saída), caso tenham ido parar na
+    pasta de um cliente — já aconteceu de o PDF do Francisco ficar na pasta
+    do José Arnaldo e o levantamento ler endereço/CPF dele como se fossem do
+    José. Dois sinais: nome no padrão NOME_DO_TITULAR_UC_NUMERO e cabeçalho
+    fixo dos documentos que o app gera. Arquivo assim é pulado por inteiro."""
+    if re.search(r"_UC_[\d][\d\.\-_]*(?:_[A-Za-z_]+)?\.pdf$", nome or "", re.IGNORECASE):
+        return True
+    inicio = _normalizar(texto[:600]).upper()
+    return any(m in inicio for m in (
+        "FORMULÁRIO DE ORÇAMENTO DE CONEXÃO",
+        "FORMULARIO DE ORCAMENTO DE CONEXAO",
+        "RELÁTORIO DE COMISSIONAMENTO",
+        "RELATÓRIO DE COMISSIONAMENTO",
+        "MODELO DE MEMORIAL TÉCNICO DESCRITIVO",
+    ))
+
+
 def eh_documento_fabricante_equipamento(texto: str) -> bool:
     """Detecta documentos que descrevem o EQUIPAMENTO em si — registro/
     certificado do Inmetro ou datasheet técnico de módulo/inversor —, nunca
@@ -1173,7 +1213,8 @@ def listar_arquivos_pasta(servico, pasta_id: str, _profundidade: int = 0, _total
         return _total
     resp = servico.files().list(
         q=f"'{pasta_id}' in parents and trashed = false",
-        fields="files(id, name, mimeType)",
+        fields="files(id, name, mimeType, modifiedTime)",
+        orderBy="modifiedTime desc",
         pageSize=100,
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
@@ -1185,6 +1226,8 @@ def listar_arquivos_pasta(servico, pasta_id: str, _profundidade: int = 0, _total
             listar_arquivos_pasta(servico, item["id"], _profundidade + 1, _total)
         else:
             _total.append(item)
+    if _profundidade == 0:
+        _total.sort(key=lambda i: i.get("modifiedTime") or "", reverse=True)
     return _total
 
 
@@ -1580,6 +1623,9 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
             continue
 
         texto = texto[:MAX_CARACTERES_POR_ARQUIVO]
+        if eh_documento_gerado_pelo_sistema(texto, nome):
+            resultado.arquivos_ignorados.append(f"{nome} (documento gerado pelo app — não é fonte de dados)")
+            continue
         # Documento de fabricante do equipamento (registro Inmetro,
         # datasheet) — endereço/e-mail/telefone/CEP soltos aí são sempre da
         # fabricante, nunca do cliente, então os extratores de
