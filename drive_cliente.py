@@ -278,22 +278,127 @@ def extrair_dados_art(texto: str) -> dict:
             dados["potencia_geracao_kw"] = float(m.group(1).replace(",", "."))
         except ValueError:
             pass
-    coord, achados = extrair_coordenadas(t)
-    if coord:
-        dados["fuso"], dados["coord_x"], dados["coord_y"] = coord
+    # Fuso/coordenadas NÃO vêm da ART (regra do usuário): só do Google Doc de
+    # contato do cliente (ver `extrair_coordenadas_livres` e REGRAS_FONTE_CAMPO).
+    return dados
+
+
+def extrair_disjuntores_diagrama(conteudo_pdf: bytes, tipo: str) -> dict:
+    """Disjuntores lidos do Diagrama Unifilar POR POSIÇÃO no desenho (o texto
+    corrido do PDF sai embaralhado, então não dá pra saber qual valor é de
+    qual disjuntor sem as coordenadas). Regras confirmadas pelo usuário em
+    recortes dos dois diagramas:
+      - Energisa: disjuntor GERAL = o "1P-50A" do disjuntor monopolar junto
+        ao medidor (o mais alto do desenho); disjuntor CA = o do QCA (o
+        mais próximo do rótulo "QCA"). O CC fica no padrão do formulário.
+      - Equatorial: disjuntor de entrada (GERAL) = o "40 A" do PADRÃO DE
+        ENTRADA, ao lado de "MEDIDOR BIDIRECIONAL".
+    Só devolve o que achar com segurança; na dúvida devolve vazio."""
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        return {}
+    doc = fitz.open(stream=conteudo_pdf, filetype="pdf")
+    for pagina in doc:
+        palavras = pagina.get_text("words")
+        dist = lambda a, b: ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+        tokens, rotulos, cargas_pos = [], {}, []
+        for i, w in enumerate(palavras):
+            t = w[4].strip()
+            cx, cy = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+            m = re.fullmatch(r"\d?P-(\d{2,3})A", t, re.IGNORECASE)
+            if m:
+                tokens.append(("P", int(m.group(1)), cx, cy))
+            elif (
+                re.fullmatch(r"\d{2,3}", t) and i + 1 < len(palavras)
+                and palavras[i + 1][4].strip().upper() == "A"
+                and abs(palavras[i + 1][1] - w[1]) < 4
+            ):
+                tokens.append(("A", int(t), cx, cy))
+            up = t.upper()
+            if up in ("QCA", "MEDIDOR"):
+                rotulos.setdefault(up, (cx, cy))
+            if up == "CARGAS":
+                cargas_pos.append((cx, cy))
+        if tipo == "energisa":
+            # "Cargas 1P-45A" é o disjuntor das cargas, não o da geração
+            ps = [
+                t for t in tokens if t[0] == "P"
+                and not any(dist((t[2], t[3]), c) < 60 for c in cargas_pos)
+            ]
+            if not ps:
+                continue
+            geral = min(ps, key=lambda t: t[3])
+            dados = {"disjuntor_geral_a": geral[1]}
+            outros = [t for t in ps if t is not geral]
+            if "QCA" in rotulos and outros:
+                ca = min(outros, key=lambda t: dist((t[2], t[3]), rotulos["QCA"]))
+                # só vale se estiver COLADO no rótulo do QCA — um valor mais
+                # distante pode ser de outro disjuntor (ex.: o das cargas)
+                if dist((ca[2], ca[3]), rotulos["QCA"]) < 60:
+                    dados["disjuntor_ca_a"] = ca[1]
+            return dados
+        if tipo == "equatorial":
+            if "MEDIDOR" not in rotulos:
+                continue
+            ac = [t for t in tokens if t[0] == "A"]
+            if not ac:
+                continue
+            geral = min(ac, key=lambda t: dist((t[2], t[3]), rotulos["MEDIDOR"]))
+            return {"disjuntor_entrada_a": geral[1]}
+    return {}
+
+
+def eh_conta_de_energia(texto: str) -> bool:
+    """Conta/fatura de energia (Energisa ou Equatorial): só esses documentos
+    são fonte de classe, tipo de conexão/ligação, tensão e zona. Um diagrama
+    cita "Monofásico" por causa do inversor, por exemplo — não é a conta."""
+    tu = texto.upper()
+    return (
+        "TIPO DE FORNECIMENTO" in tu
+        or "GRUPO E SUBGRUPO DE TENS" in tu
+        or ("LIM. MIN" in tu and "ENERGISA" in tu)
+    )
+
+
+def extrair_dados_conta_equatorial(texto: str) -> dict:
+    """Conta de energia da Equatorial (caso real: "Grupo e Subgrupo de
+    Tensao: B1 / MONO", "Tensao Nom.: 220 V", "Classificacao: RESIDENCIAL
+    RESIDENCIAL NORMAL"). Só lê se o documento for mesmo uma conta."""
+    dados = {}
+    if not eh_conta_de_energia(texto):
+        return dados
+    m = re.search(r"Grupo\s+e\s+Subgrupo\s+de\s+Tens[aã]o\s*:\s*\S+\s*/\s*(MONO|BI|TRI)", texto, re.IGNORECASE)
+    if m:
+        dados["tipo_conexao"] = {"MONO": "MONOFÁSICO", "BI": "BIFÁSICO", "TRI": "TRIFÁSICO"}[m.group(1).upper()]
+    m = re.search(r"Tens[aã]o\s+Nom\.?\s*:\s*(\d{2,3})\s*V", texto, re.IGNORECASE)
+    if m:
+        dados["tensao_atendimento_v"] = m.group(1)
+    m = re.search(r"Classifica[cç][aã]o\s*:\s*(RESIDENCIAL|COMERCIAL|INDUSTRIAL|RURAL)", texto, re.IGNORECASE)
+    if m:
+        dados["classe"] = m.group(1).upper()
     return dados
 
 
 def extrair_dados_conta_energisa(texto: str) -> dict:
     dados = {}
     tu = texto.upper()
+    if eh_conta_de_energia(texto):
+        m_cl = re.search(r"Tipo\s+de\s+Fornecimento\s*:?\s*(?:MONO|BI|TRI)F[ÁA]SICO\s+(RESIDENCIAL|COMERCIAL|INDUSTRIAL|RURAL)", texto, re.IGNORECASE)
+        if m_cl:
+            dados["classe"] = m_cl.group(1).upper()
+    if not eh_conta_de_energia(texto):
+        m = re.search(r"\b(\d{8,13})\b\s*-?\s*(?:UC|UNIDADE CONSUMIDORA)", tu)
+        if m:
+            dados["uc"] = m.group(1)
+        return dados
     if "MONOFASICO" in tu or "MONOFÁSICO" in tu:
         dados["tipo_conexao"] = "MONOFÁSICO"
     elif "BIFASICO" in tu or "BIFÁSICO" in tu:
         dados["tipo_conexao"] = "BIFÁSICO"
     elif "TRIFASICO" in tu or "TRIFÁSICO" in tu:
         dados["tipo_conexao"] = "TRIFÁSICO"
-    m = re.search(r"Lim\.\s*Min\.\s*[:\.]?\s*(\d+)\s*Lim\.\s*Max\.\s*[:\.]?\s*(\d+)", texto)
+    m = re.search(r"Lim\.\s*Min\.\s*[:\.]?\s*(\d+)\s*Lim\.\s*Max\.\s*[:\.]?\s*(\d+)", texto, re.IGNORECASE)
     if m:
         minimo, maximo = int(m.group(1)), int(m.group(2))
         media = (minimo + maximo) / 2
@@ -1067,6 +1172,37 @@ def eh_documento_fabricante_equipamento(texto: str) -> bool:
     return sum(1 for marcador in marcadores if marcador in tu) >= 2
 
 
+def extrair_cabos_energisa(texto: str) -> dict:
+    """Bitola dos cabos no Diagrama Unifilar da Energisa: o rótulo do cabo do
+    QCA vem como "1F+N+T / 1# 16(16)16 / QCA" — N condutores FASE, bitola
+    fase 16, NEUTRO entre parênteses (16) e TERRA 16, em mm². Só aceita esse
+    rótulo (o logo antes de "QCA"), nunca o do ramal de entrada nem o da rede
+    de alumínio, e só quando houver um único valor distinto. Valor lido
+    aparece pré-preenchido e editável no formulário."""
+    achados = set(re.findall(
+        r"F\+N\+T\s*(\d)\s*#\s*(\d{1,3})\s*\(\s*(\d{1,3})\s*\)\s*(\d{1,3})\s*QCA\b",
+        texto, re.IGNORECASE,
+    ))
+    if len(achados) != 1:
+        return {}
+    _n, f, ne, t = next(iter(achados))
+    return {"bitola_fase": int(f), "bitola_neutro": int(ne), "bitola_terra": int(t)}
+
+
+def extrair_cabos_equatorial(texto: str) -> dict:
+    """Bitola dos cabos no Diagrama Unifilar da Equatorial: rótulos do tipo
+    "1#10 mm² - PVC 70°C - 0,6/1 kV - Classe 2". Só preenche fase e neutro,
+    e só quando TODOS esses rótulos do desenho têm a mesma bitola — se
+    houver bitolas diferentes (ex.: CC vs. CA) não dá pra saber qual é qual
+    pelo texto, então não preenche nada. O terra não tem rótulo próprio
+    confiável no texto e continua sendo digitado."""
+    achados = {m for m in re.findall(r"\d\s*#\s*(\d{1,3})\s*mm\s*[²2]\s*-", texto, re.IGNORECASE)}
+    if len(achados) != 1:
+        return {}
+    b = int(next(iter(achados)))
+    return {"bitola_fase": b, "bitola_neutro": b}
+
+
 CAMPOS_TIPO = {
     # Repare que não tem nenhum extrator de "Pedido de kit solar" aqui — de
     # propósito. Desse tipo de documento só se aproveita a lista de
@@ -1080,12 +1216,13 @@ CAMPOS_TIPO = {
     # que não tem nada a ver (um risco real: já vimos um desenho CAD cheio
     # de legendas técnicas enganar o regex frouxo de endereço solto).
     "energisa": (
-        extrair_dados_art, extrair_projeto_executivo, extrair_dados_conta_energisa,
+        extrair_dados_art, extrair_projeto_executivo, extrair_cabos_energisa, extrair_dados_conta_energisa,
         extrair_endereco_livre, extrair_endereco_bloco_cep, extrair_contato_livre,
         extrair_coordenadas_livres, extrair_dados_genericos,
     ),
     "equatorial": (
-        extrair_dados_art, extrair_projeto_executivo, extrair_endereco_livre,
+        extrair_dados_art, extrair_projeto_executivo, extrair_cabos_equatorial,
+        extrair_dados_conta_equatorial, extrair_endereco_livre,
         extrair_endereco_bloco_cep, extrair_contato_livre, extrair_coordenadas_livres,
         extrair_dados_genericos,
     ),
@@ -1608,6 +1745,40 @@ class ResultadoLevantamento:
     fonte_imagem_localizacao: str = ""
 
 
+# Regras de fonte por campo, definidas pelo usuário (tabela de fontes): para
+# cada campo, a lista ORDENADA de tipos de documento aceitos — o primeiro é
+# o de maior prioridade e SUBSTITUI um valor já lido de um tipo de menor
+# prioridade (independente da data do arquivo). Campos fora desta tabela
+# seguem a regra antiga: o primeiro arquivo que achar, ganha.
+#   "contato" = Google Doc de contato; "conta" = conta/fatura de energia;
+#   "diagrama" = Projeto Executivo/Diagrama Unifilar.
+REGRAS_FONTE_CAMPO = {
+    "fuso": ["contato"], "coord_x": ["contato"], "coord_y": ["contato"],
+    "tipo_conexao": ["conta", "diagrama"],
+    "classe": ["conta"],
+    "tensao_atendimento_v": ["conta"],
+    "zona": ["conta"],
+}
+
+
+def classificar_documento(texto: str, eh_cartao_contato: bool) -> str:
+    if eh_cartao_contato:
+        return "contato"
+    tu = texto.upper()
+    if "ANOTAÇÃO DE RESPONSABILIDADE TÉCNICA" in tu or "ANOTACAO DE RESPONSABILIDADE TECNICA" in tu:
+        return "art"
+    if eh_conta_de_energia(texto):
+        return "conta"
+    if (
+        "DIAGRAMA UNIFILAR" in tu or "PROJETO EXECUTIVO" in tu
+        or "PROJETO DE GERAÇÃO DISTRIBUÍDA" in tu or "UNIDADE CONSUMIDORA (N" in tu
+        or "SFCR" in tu or "SISTEMA FOTOVOLTAICO CONECTADO" in tu
+        or "INFORMAÇOES BASICAS DA GERAÇÃO" in tu or "INFORMAÇÕES BÁSICAS DA GERAÇÃO" in tu
+    ):
+        return "diagrama"
+    return "outro"
+
+
 def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
     """Função principal: lista os arquivos da pasta do cliente, extrai
     texto de cada um e reconhece os campos possíveis. NUNCA sobrescreve um
@@ -1620,6 +1791,7 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
     # pasta — só pra comparar com o resultado final no fim da função e virar
     # aviso quando for diferente; nunca usado pra preencher campo nenhum.
     _equipamentos_espelho = []
+    _prioridade_campo = {}  # campo -> índice da fonte em REGRAS_FONTE_CAMPO
 
     arquivos = listar_arquivos_pasta(servico, pasta_id)
     for arquivo in arquivos:
@@ -1655,10 +1827,22 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
         tag_fonte = " (fabricante do equipamento — não usado p/ endereço/contato)" if eh_fabricante else ""
         resultado.arquivos_lidos.append(f"{nome} (OCR){tag_fonte}" if via_ocr else f"{nome}{tag_fonte}")
         achados = {} if eh_fabricante else extrair_campos_arquivo(texto, tipo, eh_cartao_contato)
+        tipo_doc = classificar_documento(texto, eh_cartao_contato)
         for campo, valor in achados.items():
-            if campo not in resultado.campos:
+            regra = REGRAS_FONTE_CAMPO.get(campo)
+            fonte_txt = f"{nome} (OCR — confira com atenção redobrada)" if via_ocr else nome
+            if regra:
+                if tipo_doc not in regra:
+                    continue
+                prio = regra.index(tipo_doc)
+                if campo in resultado.campos and _prioridade_campo.get(campo, 99) <= prio:
+                    continue
                 resultado.campos[campo] = valor
-                resultado.fontes[campo] = f"{nome} (OCR — confira com atenção redobrada)" if via_ocr else nome
+                resultado.fontes[campo] = fonte_txt
+                _prioridade_campo[campo] = prio
+            elif campo not in resultado.campos:
+                resultado.campos[campo] = valor
+                resultado.fontes[campo] = fonte_txt
 
         # As duas extrações de equipamento abaixo, ao contrário de
         # `extrair_campos_arquivo` (que já protege cada extrator
@@ -1825,6 +2009,22 @@ def levantamento_pasta(pasta_id: str, tipo: str) -> ResultadoLevantamento:
                     resultado.fonte_imagem_localizacao = nome
             except Exception as exc:
                 resultado.erros.append(f"[erro ao recortar imagem de localização de {nome}: {exc}]")
+
+        # Disjuntores (geral/CA na Energisa; entrada na Equatorial) lidos por
+        # POSIÇÃO no Diagrama Unifilar — ver `extrair_disjuntores_diagrama`.
+        if (
+            tipo_doc == "diagrama"
+            and arquivo["mimeType"] == "application/pdf"
+            and not any(c in resultado.campos for c in ("disjuntor_geral_a", "disjuntor_entrada_a"))
+        ):
+            try:
+                conteudo_pdf = servico.files().get_media(fileId=arquivo["id"]).execute()
+                for campo, valor in extrair_disjuntores_diagrama(conteudo_pdf, tipo).items():
+                    if campo not in resultado.campos:
+                        resultado.campos[campo] = valor
+                        resultado.fontes[campo] = f"{nome} (posição no desenho — confira)"
+            except Exception as exc:
+                resultado.erros.append(f"[erro ao ler disjuntores de {nome}: {exc}]")
 
     # Agora que a pasta inteira já foi lida (resultado.paineis/inversores
     # já são os finais, vindos só do pedido de kit/Projeto Executivo/

@@ -414,6 +414,24 @@ MAPA_CAMPOS_EQUATORIAL = {
 }
 
 
+# Tabela 1 da norma da Equatorial (NT.00001.EQTL, ramal de conexão e entrada
+# em 220/380V): disjuntor -> faixa de carga instalada (kW). Fonte: recorte da
+# norma enviado pelo usuário. Devolve o LIMITE SUPERIOR da faixa (None se o
+# tipo/disjuntor não estiver na tabela, ex.: bifásico).
+TABELA_CARGA_EQUATORIAL = {
+    "MONOFÁSICO": {25: (0.0, 5.0), 40: (5.1, 8.0), 63: (8.1, 12.0)},
+    "TRIFÁSICO": {20: (0.0, 12.0), 40: (12.1, 24.0), 63: (24.1, 38.0), 80: (38.1, 48.0)},
+}
+
+
+def _carga_por_disjuntor_equatorial(tipo_ligacao: str, disjuntor_a):
+    try:
+        faixa = TABELA_CARGA_EQUATORIAL.get(str(tipo_ligacao).upper(), {}).get(int(disjuntor_a))
+    except (TypeError, ValueError):
+        return None
+    return faixa[1] if faixa else None
+
+
 def _remapear_para_equatorial(campos: dict) -> dict:
     """Aplica MAPA_CAMPOS_EQUATORIAL e junta logradouro+número num só campo
     "endereco" (o formulário da Equatorial-GO não tem campo separado pra
@@ -689,6 +707,9 @@ disjuntor_cc_a: 32
 modalidade: Autoconsumo remoto
 potencia_trafo: 45
 numero_hastes: 6
+bitola_fase: 10
+bitola_neutro: 10
+bitola_terra: 10
 
 ---- Coordenadas e previsão de ligação ----
 fuso: 22L
@@ -723,7 +744,7 @@ tensao_nominal_v: 220"""
         paineis = blocos.get("paineis", [])
         inversores = blocos.get("inversores", [])
 
-        faltando = [c for c in ("uc", "titular") if not colado.get(c)]
+        faltando = [c for c in ("uc", "titular", "bitola_fase", "bitola_neutro", "bitola_terra") if not colado.get(c)]
         st.write(
             f"**{colado.get('titular','?')}** — UC {colado.get('uc','?')} — "
             f"{len(cargas)} carga(s), {len(paineis)} modelo(s) de painel, "
@@ -778,7 +799,7 @@ tensao_nominal_v: 220"""
                     "fuso": colado.get("fuso", ""), "coord_x": colado.get("coord_x", ""),
                     "coord_y": colado.get("coord_y", ""),
                     "tipo_tensao": "BAIXA", "cabos_por_fase": 1,
-                    "bitola_fase": 10, "bitola_neutro": 10, "bitola_terra": 10,
+                    "bitola_fase": colado.get("bitola_fase", 0), "bitola_neutro": colado.get("bitola_neutro", 0), "bitola_terra": colado.get("bitola_terra", 0),
                     "gd_ja_instalado": colado.get("gd_ja_instalado", "SIM"),
                     "mes_previsao_ligacao": colado.get("mes_previsao_ligacao", MES_PT[date.today().month - 1]),
                     "ano_previsao_ligacao": colado.get("ano_previsao_ligacao", date.today().year),
@@ -893,11 +914,16 @@ tensao_nominal_v: 220"""
     opcoes_modalidade = ["Autoconsumo remoto", "Autoconsumo local", "Geração compartilhada", "Múltiplas UCs"]
     modalidade = c1.selectbox("Modalidade", opcoes_modalidade,
                                index=_idx(opcoes_modalidade, defaults.get("modalidade")))
-    potencia_trafo = c2.text_input("Potência Trafo (kVA) — deixe em branco se não houver",
-                                    defaults.get("potencia_trafo", ""))
+    potencia_trafo = c2.text_input("Potência Trafo (kVA) — padrão 75 (na maioria dos casos); confira no mapa abaixo",
+                                    defaults.get("potencia_trafo", "75"))
     numero_hastes = c3.number_input("Número de hastes", value=_num(defaults, "numero_hastes", 6))
 
-    st.caption("Bitola dos cabos CA (mm²) — varia a cada projeto; leia do Diagrama Unifilar (ex.: 2#16(16)16 = fase 16, neutro 16, terra 16).")
+    _res_trafo = st.session_state.get("drive_resultado_energisa")
+    _img_trafo = getattr(_res_trafo, "imagem_localizacao", None)
+    if _img_trafo:
+        st.image(_img_trafo, caption="Mapa do Diagrama Unifilar — a potência do transformador é o número depois do traço no rótulo do triângulo vermelho mais próximo (ex.: …-75 = 75 kVA). Preencha em 'Potência Trafo' acima.")
+
+    st.caption("Bitola dos cabos (mm²) conforme o Diagrama Unifilar do projeto (ex.: 1#10(10)10 = fase 10, neutro 10, terra 10) — varia a cada projeto.")
     c1, c2, c3 = st.columns(3)
     bitola_fase = c1.number_input("Bitola fase (mm²)", value=_num(defaults, "bitola_fase", 0), min_value=0)
     bitola_neutro = c2.number_input("Bitola neutro (mm²)", value=_num(defaults, "bitola_neutro", 0), min_value=0)
@@ -955,7 +981,7 @@ tensao_nominal_v: 220"""
             st.error("Preencha ao menos UC e Titular.")
             return
         if not (bitola_fase and bitola_neutro and bitola_terra):
-            st.error("Informe a bitola dos cabos (fase, neutro e terra) — varia a cada projeto, o app não assume valor.")
+            st.error("Informe a bitola dos cabos (fase, neutro e terra) conforme o Diagrama Unifilar — o app não assume valor.")
             return
 
         dados = {
@@ -1325,9 +1351,14 @@ dht_corrente_pct: 3"""
 
     c1, c2, c3 = st.columns(3)
     disjuntor_entrada_a = c1.number_input("Disjuntor de Entrada (A)", value=_num(defaults, "disjuntor_entrada_a", 50))
-    carga_declarada_kw = c2.number_input("Carga Declarada (kW)", value=_num(defaults, "carga_declarada_kw", 10.0))
+    _carga_norma = _carga_por_disjuntor_equatorial(tipo_ligacao, disjuntor_entrada_a)
+    carga_declarada_kw = c2.number_input("Carga Declarada (kW)", value=_carga_norma or _num(defaults, "carga_declarada_kw", 10.0))
     potencia_disponibilizada_kw = c3.number_input("Potência Disponibilizada — PD (kW)",
-                                                    value=_num(defaults, "potencia_disponibilizada_kw", 10.0))
+                                                    value=_carga_norma or _num(defaults, "potencia_disponibilizada_kw", 10.0))
+    if _carga_norma:
+        st.caption(f"Carga e PD sugeridas pela Tabela 1 da norma ({tipo_ligacao}, disjuntor {int(disjuntor_entrada_a)} A → até {_carga_norma:g} kW, limite superior da faixa) — confira.")
+    else:
+        st.caption("Disjuntor/tipo de ligação fora da Tabela 1 da norma (ex.: bifásico) — informe carga e PD manualmente.")
 
     opcoes_ramal_go = ["AÉREO", "SUBTERRÂNEO"]
     tipo_ramal = st.selectbox("Tipo de Ramal", opcoes_ramal_go,
@@ -1348,7 +1379,7 @@ dht_corrente_pct: 3"""
     c1, c2 = st.columns(2)
     opcoes_modalidade_go = ["AUTOCONSUMO LOCAL", "AUTOCONSUMO REMOTO"]
     modalidade_compensacao = c1.selectbox("Modalidade de Compensação", opcoes_modalidade_go,
-                                           index=_idx(opcoes_modalidade_go, defaults.get("modalidade_compensacao")))
+                                           index=_idx(opcoes_modalidade_go, defaults.get("modalidade_compensacao"), 1))
     data_inicio = c2.date_input("Data de início de operação", value=date.today() + timedelta(days=15))
 
     st.subheader("4. Módulos")
