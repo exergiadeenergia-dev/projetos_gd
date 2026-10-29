@@ -123,7 +123,21 @@ def montar_substituicoes_memorial(dados):
     )
 
     inv = c["inversores"][0]
+    # Bitola dos cabos (varia a cada projeto — nunca usar o valor do modelo
+    # de referência). Só substitui quando o app informou os três valores.
+    cabos = {}
+    bf, bn, bt = (c.get("bitola_fase_mm2"), c.get("bitola_neutro_mm2"), c.get("bitola_terra_mm2"))
+    if bf and bn and bt:
+        cabos = {
+            "FASE de seção nominal 10 mm2 e um condutor NEUTRO de seção nominal 10 mm2":
+                f"FASE de seção nominal {bf:g} mm2 e um condutor NEUTRO de seção nominal {bn:g} mm2",
+            "FASE de diâmetro nominal 10 mm2 e um condutor NEUTRO de diâmetro nominal 10 mm2":
+                f"FASE de diâmetro nominal {bf:g} mm2 e um condutor NEUTRO de diâmetro nominal {bn:g} mm2",
+            "condutor de 10 mm2 com conexão": f"condutor de {bt:g} mm2 com conexão",
+            "Cabo de Aterramento de 10mm²": f"Cabo de Aterramento de {bt:g}mm²",
+        }
     return {
+        **cabos,
         ref["nome"]: c["nome"],
         ref["conta_contrato"]: c["conta_contrato"],
         ref["endereco_uc"]: c["endereco"],

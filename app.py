@@ -410,6 +410,7 @@ MAPA_CAMPOS_EQUATORIAL = {
     "logradouro": "endereco",
     "cidade": "municipio",
     "tipo_conexao": "tipo_ligacao",
+    "uc": "uc_existente",
 }
 
 
@@ -418,6 +419,11 @@ def _remapear_para_equatorial(campos: dict) -> dict:
     "endereco" (o formulário da Equatorial-GO não tem campo separado pra
     número — é "Endereço (rua, número, complemento)" tudo numa caixa só)."""
     campos = dict(campos)
+    # UC da Equatorial: 12 dígitos no formato pontuado X.XXX.XXX.XXX-XX
+    # (é assim que aparece nos documentos e na conta de energia).
+    uc_digitos = re.sub(r"\D", "", str(campos.get("uc", "")))
+    if len(uc_digitos) == 12:
+        campos["uc"] = f"{uc_digitos[0]}.{uc_digitos[1:4]}.{uc_digitos[4:7]}.{uc_digitos[7:10]}-{uc_digitos[10:]}"
     numero = campos.pop("numero", None)
     quadra = campos.pop("quadra", None)
     lote = campos.pop("lote", None)
@@ -891,6 +897,12 @@ tensao_nominal_v: 220"""
                                     defaults.get("potencia_trafo", ""))
     numero_hastes = c3.number_input("Número de hastes", value=_num(defaults, "numero_hastes", 6))
 
+    st.caption("Bitola dos cabos CA (mm²) — varia a cada projeto; leia do Diagrama Unifilar (ex.: 2#16(16)16 = fase 16, neutro 16, terra 16).")
+    c1, c2, c3 = st.columns(3)
+    bitola_fase = c1.number_input("Bitola fase (mm²)", value=_num(defaults, "bitola_fase", 0), min_value=0)
+    bitola_neutro = c2.number_input("Bitola neutro (mm²)", value=_num(defaults, "bitola_neutro", 0), min_value=0)
+    bitola_terra = c3.number_input("Bitola terra (mm²)", value=_num(defaults, "bitola_terra", 0), min_value=0)
+
     st.subheader("5. Coordenadas e previsão de ligação")
     c1, c2, c3 = st.columns(3)
     fuso = c1.text_input(_rotulo("Fuso (ex: 22L)", "fuso", defaults, _k("fuso")), defaults.get("fuso", ""), key=_k("fuso"))
@@ -942,6 +954,9 @@ tensao_nominal_v: 220"""
         if not uc or not titular:
             st.error("Preencha ao menos UC e Titular.")
             return
+        if not (bitola_fase and bitola_neutro and bitola_terra):
+            st.error("Informe a bitola dos cabos (fase, neutro e terra) — varia a cada projeto, o app não assume valor.")
+            return
 
         dados = {
             "responsavel_tecnico": {
@@ -966,7 +981,7 @@ tensao_nominal_v: 220"""
                 "demanda_contratada_kwg": 0,
                 "fuso": fuso, "coord_x": coord_x, "coord_y": coord_y,
                 "tipo_tensao": "BAIXA", "cabos_por_fase": 1,
-                "bitola_fase": 10, "bitola_neutro": 10, "bitola_terra": 10,
+                "bitola_fase": bitola_fase, "bitola_neutro": bitola_neutro, "bitola_terra": bitola_terra,
                 "gd_ja_instalado": gd_ja_instalado,
                 "mes_previsao_ligacao": MES_PT[data_prevista.month - 1],
                 "ano_previsao_ligacao": data_prevista.year,
@@ -1318,6 +1333,12 @@ dht_corrente_pct: 3"""
     tipo_ramal = st.selectbox("Tipo de Ramal", opcoes_ramal_go,
                                index=_idx(opcoes_ramal_go, defaults.get("tipo_ramal")))
 
+    st.caption("Bitola dos cabos (mm²) — varia a cada projeto; leia do Diagrama Unifilar (ex.: 2#16(16)16 = fase 16, neutro 16, terra 16).")
+    c1, c2, c3 = st.columns(3)
+    bitola_fase_mm2 = c1.number_input("Bitola fase (mm²)", value=_num(defaults, "bitola_fase", 0), min_value=0)
+    bitola_neutro_mm2 = c2.number_input("Bitola neutro (mm²)", value=_num(defaults, "bitola_neutro", 0), min_value=0)
+    bitola_terra_mm2 = c3.number_input("Bitola terra (mm²)", value=_num(defaults, "bitola_terra", 0), min_value=0)
+
     st.subheader("3. Coordenadas e modalidade")
     c1, c2, c3 = st.columns(3)
     fuso = c1.text_input(_rotulo("Fuso (ex: 22L)", "fuso", defaults, _k("fuso")), defaults.get("fuso", ""), key=_k("fuso"))
@@ -1409,6 +1430,9 @@ dht_corrente_pct: 3"""
         if not nome or not cpf_cnpj:
             st.error("Preencha ao menos Nome e CPF/CNPJ.")
             return
+        if not (bitola_fase_mm2 and bitola_neutro_mm2 and bitola_terra_mm2):
+            st.error("Informe a bitola dos cabos (fase, neutro e terra) — varia a cada projeto, o app não assume valor.")
+            return
 
         dados = {
             "responsavel_tecnico": {
@@ -1433,6 +1457,8 @@ dht_corrente_pct: 3"""
                 "cargas_especiais": "NÃO", "ramo_atividade": classe, "classe": classe,
                 "tipo_ligacao": tipo_ligacao, "tensao_atendimento_v": tensao_atendimento_v,
                 "carga_declarada_kw": carga_declarada_kw, "disjuntor_entrada_a": disjuntor_entrada_a,
+                "bitola_fase_mm2": bitola_fase_mm2, "bitola_neutro_mm2": bitola_neutro_mm2,
+                "bitola_terra_mm2": bitola_terra_mm2,
                 "potencia_disponibilizada_kw": potencia_disponibilizada_kw, "tipo_ramal": tipo_ramal,
                 "fuso": fuso, "coord_x": coord_x, "coord_y": coord_y,
                 "modalidade_compensacao": modalidade_compensacao,

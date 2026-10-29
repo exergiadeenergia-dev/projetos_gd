@@ -638,6 +638,20 @@ def extrair_projeto_executivo(texto: str) -> dict:
         except ValueError:
             pass
 
+    # UC no Diagrama Unifilar da Equatorial: o texto do PDF sai embaralhado e
+    # o número da UC costuma aparecer SOLTO, longe do rótulo "UNIDADE
+    # CONSUMIDORA (N°)" (caso real da Renata: "POTÊNCIA: 6,82 kW
+    # 3.455.894.012-48"). Fallback: só neste tipo de documento (carimbo de
+    # Diagrama Unifilar) e só se o rótulo acima não achou nada, aceita o
+    # formato pontuado da UC da Equatorial (X.XXX.XXX.XXX-XX).
+    if "uc" not in dados and (
+        "DIAGRAMA UNIFILAR" in texto.upper()
+        or "UNIDADE CONSUMIDORA (N" in texto.upper()
+    ):
+        ucs = set(re.findall(r"(?<![\d.])(\d\.\d{3}\.\d{3}\.\d{3}-\d{2})(?![\d])", texto))
+        if len(ucs) == 1:
+            dados["uc"] = re.sub(r"\D", "", ucs.pop())
+
     return dados
 
 
