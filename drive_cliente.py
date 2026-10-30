@@ -267,6 +267,12 @@ def extrair_dados_art(texto: str) -> dict:
     if m and m.group(1).strip():
         dados["complemento"] = m.group(1).strip().title()
 
+    # Finalidade da obra (ex.: "Residencial") — usada no Relatório de
+    # Comissionamento da Equatorial ("CASA - RESIDENCIA" no endereço).
+    m = re.search(r"Finalidade:\s*([A-Za-zÀ-ÿ]+)", t)
+    if m:
+        dados["finalidade"] = m.group(1).strip().upper()
+
     m = re.search(r"CEP:\s*([\d\.\-]+)", t)
     if m:
         dados["cep"] = re.sub(r"\D", "", m.group(1))

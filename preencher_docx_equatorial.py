@@ -99,11 +99,19 @@ def replace_everywhere(doc, replacements):
                     process_paragraph(p)
 
 
-def fix_tabela_gerador(doc, quantidade_modulos, potencia_kw):
+def fix_tabela_gerador(doc, quantidade_modulos, potencia_kw, potencia_modulo_w=None):
     """Corrige diretamente (por índice de célula, não por busca de texto —
     números curtos como '8' são perigosos demais para substituição global)
     as linhas 'Quantidade' e 'Potência do gerador [kW]' da Tabela 3."""
     t = doc.tables[0]
+    if potencia_modulo_w:
+        # "Potência nominal – Pn [W]" do módulo (vem do Diagrama Unifilar);
+        # o modelo traz fixo o 590 W do módulo de referência.
+        c_pn = t.rows[2].cells[1].paragraphs[0]
+        if c_pn.runs:
+            c_pn.runs[0].text = f"{potencia_modulo_w:g}"
+            for run in c_pn.runs[1:]:
+                run.text = ""
     t.rows[12].cells[1].paragraphs[0].runs[0].text = str(quantidade_modulos)
     for run in t.rows[12].cells[1].paragraphs[0].runs[1:]:
         run.text = ""
@@ -117,7 +125,12 @@ def montar_substituicoes_memorial(dados):
     c = dados["cliente"]
     ref = dados["_referencia_hakknner"]
     m = c["modulos"][0]
-    pot_kw = sum(mm["potencia_w"] * mm["quantidade"] for mm in c["modulos"]) / 1000
+    pot_kw_modulos = sum(mm["potencia_w"] * mm["quantidade"] for mm in c["modulos"]) / 1000
+    # Regra min(): a potência do sistema (título/objetivo do Memorial, igual
+    # à da ART) é o MENOR entre módulos e inversores, nunca a soma bruta
+    # dos módulos.
+    pot_inv_kw = sum(float(i.get("potencia_nominal_kw") or 0) for i in c["inversores"])
+    pot_kw = min(pot_kw_modulos, pot_inv_kw) if pot_inv_kw > 0 else pot_kw_modulos
     equip_desc = " + ".join(
         f'{mm["quantidade"]} módulos {mm["fabricante"]}/{mm["modelo"]}' for mm in c["modulos"]
     )
@@ -170,7 +183,8 @@ def montar_substituicoes_comissionamento(dados):
         ref["telefone_cliente"]: c["telefone_cliente"],
         ref["uc_pontuado"]: c["conta_contrato"],
         ref["data_conclusao"]: c["data_conclusao_geradora"],
-        ref["endereco_completo"]: c["endereco_completo_comissionamento"],
+        ref["comissionamento_endereco_linha1"]: c["endereco_completo_comissionamento"].split("\n")[0],
+        ref["comissionamento_endereco_linha2"]: (c["endereco_completo_comissionamento"].split("\n") + [""])[1],
         ref["cep"]: str(c["cep"]),
         ref["cidade"]: c["municipio"],
         ref["fab_modulo"]: m["fabricante"],

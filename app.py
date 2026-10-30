@@ -258,6 +258,10 @@ REFERENCIA_HAKKNNER = {
     "uc_pontuado": "0.000.000.000-00",
     "data_conclusao": "24/06/2026",
     "endereco_completo": "RUA EXEMPLO, Q. 00, L. 00, S/N, CASA - RESIDENCIA\nSETOR EXEMPLO",
+    # Texto que REALMENTE está digitado no Modelo_Comissionamento_MODELO.docx
+    # (dois parágrafos: rua e bairro) — é ele que tem que ser substituído.
+    "comissionamento_endereco_linha1": "RUA BERNARDO JOSE PERES, Q. 07, L. 18, S/N, CASA - RESIDENCIA",
+    "comissionamento_endereco_linha2": "SETOR CEARA",
     "fab_inversor": "SOFAR",
     "modelo_inversor": "5KTLM-G3",
     "fab_inversor_typo_memorial": "SOAR",
@@ -430,6 +434,12 @@ def _carga_por_disjuntor_equatorial(tipo_ligacao: str, disjuntor_a):
     except (TypeError, ValueError):
         return None
     return faixa[1] if faixa else None
+
+
+def _endereco_comissionamento(endereco: str, bairro: str, finalidade) -> str:
+    """Endereço (da ART) na 1ª linha e o bairro na 2ª — formato do Relatório
+    de Comissionamento. Sem sufixo "CASA - RESIDENCIA": não existe."""
+    return f"{endereco.upper()}\n{bairro.upper()}"
 
 
 def _remapear_para_equatorial(campos: dict) -> dict:
@@ -1298,7 +1308,7 @@ dht_corrente_pct: 3"""
                     "mes_ano_documento": f"{MES_PT[data_inicio.month-1].capitalize()} – {data_inicio.year}",
                     "telefone_cliente": colado_go.get("celular", ""),
                     "data_conclusao_geradora": data_inicio.strftime("%d/%m/%Y"),
-                    "endereco_completo_comissionamento": f"{endereco_go.upper()}\n{bairro_go.upper()}",
+                    "endereco_completo_comissionamento": _endereco_comissionamento(endereco_go, bairro_go, colado_go.get("finalidade")),
                     "modulos": modulos, "inversores": inversores,
                 },
             }
@@ -1498,7 +1508,7 @@ dht_corrente_pct: 3"""
                 "mes_ano_documento": f"{MES_PT[data_inicio.month-1].capitalize()} – {data_inicio.year}",
                 "telefone_cliente": celular,
                 "data_conclusao_geradora": data_inicio.strftime("%d/%m/%Y"),
-                "endereco_completo_comissionamento": f"{endereco.upper()}\n{bairro.upper()}",
+                "endereco_completo_comissionamento": _endereco_comissionamento(endereco, bairro, defaults.get("finalidade")),
                 "modulos": modulos, "inversores": inversores,
             },
         }
@@ -1540,7 +1550,7 @@ def gerar_equatorial(dados, foto_upload, imagem_auto: bytes | None = None):
             replace_everywhere(doc, montar_substituicoes_memorial(dados))
             qtd = sum(m["quantidade"] for m in dados["cliente"]["modulos"])
             pot = sum(m["potencia_w"] * m["quantidade"] for m in dados["cliente"]["modulos"]) / 1000
-            fix_tabela_gerador(doc, qtd, pot)
+            fix_tabela_gerador(doc, qtd, pot, dados["cliente"]["modulos"][0]["potencia_w"])
             # Prioridade: foto que o usuário subiu na mão (ele pode ter
             # trocado de propósito) > print recortado automaticamente do
             # Diagrama Unifilar > nenhuma foto (mantém a do modelo).
@@ -1566,13 +1576,19 @@ def gerar_equatorial(dados, foto_upload, imagem_auto: bytes | None = None):
             from pypdf import PdfReader, PdfWriter
             anexo_pdf_full = xlsx_path.with_suffix(".pdf")
             reader = PdfReader(str(anexo_pdf_full))
-            writer = PdfWriter()
-            for i in [1, 2, 3, 4]:
-                if i < len(reader.pages):
-                    writer.add_page(reader.pages[i])
-            anexo_pdf = tmp / f"{nome_base}_AnexoI.pdf"
-            with open(anexo_pdf, "wb") as f:
-                writer.write(f)
+            # Anexo I separado em 2 PDFs: (1) informações do gerador
+            # (págs. 1-2) e (2) só o Formulário de Solicitação de Acesso
+            # (pág. 3). A lista de rateio (pág. 4) não é gerada.
+            def _pdf_paginas(indices, caminho):
+                w = PdfWriter()
+                for i in indices:
+                    if i < len(reader.pages):
+                        w.add_page(reader.pages[i])
+                with open(caminho, "wb") as f:
+                    w.write(f)
+                return caminho
+            anexo_gerador_pdf = _pdf_paginas([1, 2], tmp / f"{nome_base}_AnexoI_Gerador.pdf")
+            anexo_solic_pdf = _pdf_paginas([3], tmp / f"{nome_base}_AnexoI_Solicitacao_de_Acesso.pdf")
 
         # Guarda os bytes na sessão (a pasta temporária é apagada ao sair
         # deste bloco, e clicar num botão de download recarrega a página).
@@ -1580,7 +1596,8 @@ def gerar_equatorial(dados, foto_upload, imagem_auto: bytes | None = None):
             "nome_base": nome_base,
             "avisos": avisos,
             "anexo_xlsx_bytes": xlsx_path.read_bytes(), "anexo_xlsx_nome": xlsx_path.name,
-            "anexo_pdf_bytes": anexo_pdf.read_bytes(), "anexo_pdf_nome": anexo_pdf.name,
+            "anexo_gerador_bytes": anexo_gerador_pdf.read_bytes(), "anexo_gerador_nome": anexo_gerador_pdf.name,
+            "anexo_solic_bytes": anexo_solic_pdf.read_bytes(), "anexo_solic_nome": anexo_solic_pdf.name,
             "memorial_docx_bytes": memorial_path.read_bytes(), "memorial_docx_nome": memorial_path.name,
             "memorial_pdf_bytes": memorial_path.with_suffix(".pdf").read_bytes(),
             "memorial_pdf_nome": memorial_path.with_suffix(".pdf").name,
@@ -1602,16 +1619,19 @@ def mostrar_downloads_equatorial():
         st.success("Checagem de viabilidade: OK")
 
     st.success("Documentos gerados!")
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.download_button("⬇️ Anexo I (.xlsx)", saida["anexo_xlsx_bytes"], saida["anexo_xlsx_nome"], key="dl_anexo_xlsx")
-    c2.download_button("⬇️ Anexo I (.pdf)", saida["anexo_pdf_bytes"], saida["anexo_pdf_nome"], key="dl_anexo_pdf")
+    l1 = st.columns(3)
+    l1[0].download_button("⬇️ Anexo I (.xlsx)", saida["anexo_xlsx_bytes"], saida["anexo_xlsx_nome"], key="dl_anexo_xlsx")
+    l1[1].download_button("⬇️ Anexo I — Gerador (págs. 1-2, .pdf)", saida["anexo_gerador_bytes"], saida["anexo_gerador_nome"], key="dl_anexo_ger")
+    l1[2].download_button("⬇️ Anexo I — Solicitação de Acesso (.pdf)", saida["anexo_solic_bytes"], saida["anexo_solic_nome"], key="dl_anexo_sol")
+    c3, c4, c5, c6, c7 = st.columns(5)
     c3.download_button("⬇️ Memorial (.docx)", saida["memorial_docx_bytes"], saida["memorial_docx_nome"], key="dl_mem_docx")
     c4.download_button("⬇️ Memorial (.pdf)", saida["memorial_pdf_bytes"], saida["memorial_pdf_nome"], key="dl_mem_pdf")
     c5.download_button("⬇️ Comissionamento (.docx)", saida["comiss_docx_bytes"], saida["comiss_docx_nome"], key="dl_com_docx")
     c6.download_button("⬇️ Comissionamento (.pdf)", saida["comiss_pdf_bytes"], saida["comiss_pdf_nome"], key="dl_com_pdf")
     zip_bytes = zip_de_arquivos([
         (saida["anexo_xlsx_nome"], saida["anexo_xlsx_bytes"]),
-        (saida["anexo_pdf_nome"], saida["anexo_pdf_bytes"]),
+        (saida["anexo_gerador_nome"], saida["anexo_gerador_bytes"]),
+        (saida["anexo_solic_nome"], saida["anexo_solic_bytes"]),
         (saida["memorial_docx_nome"], saida["memorial_docx_bytes"]),
         (saida["memorial_pdf_nome"], saida["memorial_pdf_bytes"]),
         (saida["comiss_docx_nome"], saida["comiss_docx_bytes"]),
@@ -1620,7 +1640,10 @@ def mostrar_downloads_equatorial():
     c7.download_button("📦 Baixar tudo (.zip)", zip_bytes, f"documentos_{saida['nome_base']}.zip",
                         key="dl_zip_equatorial", type="primary")
     st.info("Lembrete: as seções de dimensionamento do Memorial (disjuntor, DPS, "
-            "aterramento, cabos, levantamento de carga) usam os valores de referência — revise manualmente.")
+            "aterramento, cabos, levantamento de carga) usam os valores de referência — revise manualmente. "
+            "Na Tabela 3 (módulo) só a potência nominal, a quantidade e a potência do gerador são atualizadas; "
+            "Voc, Isc, Vpmp, Ipmp, eficiência, dimensões, área e peso continuam os do módulo do modelo — "
+            "e na Tabela 4 (inversor) só fabricante/modelo — confira pelos datasheets.")
 
 
 # ============================================================
